@@ -37,6 +37,12 @@ pub(crate) struct TouchState {
     /// The app that the finger with id `n` (n > 0) is being forwarded to, and its last position.
     secondary_touches: [(Option<xous::PID>, usize, usize); 16],
 
+    /// The app that the first finger is being forwarded to.
+    primary_target: Option<xous::PID>,
+    /// Apps that missed a press or release because their input queue was full. They are sent a
+    /// `TouchCancel` as soon as their queue has room.
+    touch_resync: Vec<xous::PID>,
+
     /// Bit `n` is set while the finger with id `n` is down.
     fingers_down: u16,
     /// Set when more fingers touched than anyone would use on purpose, until they are all lifted.
@@ -57,6 +63,8 @@ impl TouchState {
             last_x: 0,
             last_y: 0,
             secondary_touches: [(None, 0, 0); 16],
+            primary_target: None,
+            touch_resync: Vec::new(),
             fingers_down: 0,
             palm_lockout: false,
         }
@@ -86,6 +94,7 @@ impl Gui {
     /// but the touch is **not** swallowed — so a single tap is enough to interact
     /// with the device even when the screen has dimmed.
     pub fn touch_dispatch(&mut self, touch: Touch, injected: bool) {
+        self.touch_resync();
         if self.touch_palm_rejected(&touch) {
             return;
         }
@@ -234,13 +243,19 @@ impl Gui {
                     );
                 }
 
-                if let Some(active_pid) = self.active_app_pid() {
-                    if let Some(active_app_window) = self.windows.get(&active_pid) {
-                        xous::try_send_message(
-                            active_app_window.input_cid,
-                            touch.as_input_message(InputMessage::Touch as usize),
-                        )
-                        .ok();
+                // The finger stays with the app it pressed in. An app that shows up in the meantime (a modal,
+                // a switch) must not get the rest of the touch, or it would see a release it never saw
+                // pressed and could activate whatever is under the finger.
+                let active_pid = self.active_app_pid();
+                if touch.kind == TouchKind::Press {
+                    self.touch_state.primary_target = active_pid;
+                }
+                if let Some(target) = self.touch_state.primary_target {
+                    if active_pid == Some(target) {
+                        self.send_app_touch(target, touch);
+                    } else {
+                        self.send_touch_cancel(target);
+                        self.touch_state.primary_target = None;
                     }
                 }
             }
@@ -268,7 +283,65 @@ impl Gui {
             }
 
             self.touch_state.origin = TouchGestureOrigin::None;
+            self.touch_state.primary_target = None;
         }
+    }
+
+    /// Takes a finger whose lift was missed away, without activating anything where it was last seen.
+    pub(crate) fn touch_cancel_finger(&mut self, id: usize) {
+        let state = &mut self.touch_state;
+        state.fingers_down &= !1u16.checked_shl(id as u32).unwrap_or(0);
+        if state.palm_lockout {
+            state.palm_lockout = state.fingers_down != 0;
+            return;
+        }
+
+        if id == 0 {
+            if state.origin == TouchGestureOrigin::App {
+                if let Some(target) = state.primary_target.take() {
+                    self.send_touch_cancel(target);
+                }
+            }
+            // Other origins can't be cancelled, so they just don't hear about the finger again
+            self.touch_state.origin = TouchGestureOrigin::None;
+        } else if let Some(slot) = state.secondary_touches.get_mut(id) {
+            if let Some(target) = slot.0.take() {
+                self.send_touch_cancel(target);
+            }
+        }
+    }
+
+    /// Sends a touch to an app, and remembers to resynchronize it if it missed a press or release.
+    fn send_app_touch(&mut self, pid: xous::PID, touch: Touch) {
+        let Some(window) = self.windows.get(&pid) else { return };
+        let sent =
+            xous::try_send_message(window.input_cid, touch.as_input_message(InputMessage::Touch as usize)).is_ok();
+        // A missed drag is made up for by the next one
+        if !sent && touch.kind != TouchKind::Drag && window.multitouch && !self.touch_state.touch_resync.contains(&pid)
+        {
+            log::warn!("{pid} missed a touch, cancelling its touches");
+            self.touch_state.touch_resync.push(pid);
+        }
+    }
+
+    /// Tells an app that the fingers touching it were taken away, if it handles that.
+    fn send_touch_cancel(&mut self, pid: xous::PID) {
+        // Apps that don't handle cancellation just don't hear about the fingers again
+        let Some(window) = self.windows.get(&pid).filter(|w| w.multitouch) else { return };
+        let msg = xous::Message::new_scalar(InputMessage::TouchCancel as usize, 0, 0, 0, 0);
+        if xous::try_send_message(window.input_cid, msg).is_err() && !self.touch_state.touch_resync.contains(&pid) {
+            self.touch_state.touch_resync.push(pid);
+        }
+    }
+
+    /// Sends the cancellations that didn't fit into the apps' input queues before.
+    fn touch_resync(&mut self) {
+        let windows = &self.windows;
+        self.touch_state.touch_resync.retain(|pid| {
+            let Some(window) = windows.get(pid) else { return false };
+            let msg = xous::Message::new_scalar(InputMessage::TouchCancel as usize, 0, 0, 0, 0);
+            xous::try_send_message(window.input_cid, msg).is_err()
+        });
     }
 
     /// More fingers at once than anyone would use on purpose on this screen are a palm or a hand
@@ -326,7 +399,11 @@ impl Gui {
                 {
                     return;
                 }
+                // Apps that don't handle several fingers would take them for the first one
                 let Some(pid) = self.active_app_pid() else { return };
+                if !self.windows.get(&pid).is_some_and(|w| w.multitouch) {
+                    return;
+                }
                 pid
             }
             // Same filtering of redundant drag events as for the first finger
@@ -340,10 +417,7 @@ impl Gui {
             (if touch.kind == TouchKind::Release { None } else { Some(target) }, touch.x, touch.y);
 
         let offset = if injected { 0 } else { self.touch_state.offset };
-        let touch = touch.with_offset(0, offset);
-        if let Some(window) = self.windows.get(&target) {
-            xous::try_send_message(window.input_cid, touch.as_input_message(InputMessage::Touch as usize)).ok();
-        }
+        self.send_app_touch(target, touch.with_offset(0, offset));
     }
 
     pub(crate) fn touch_on(&mut self) {
@@ -365,20 +439,11 @@ impl Gui {
     fn touch_cancel_all(&mut self) {
         let mut apps: Vec<xous::PID> =
             self.touch_state.secondary_touches.iter().filter_map(|&(target, _, _)| target).collect();
-        if self.touch_state.origin == TouchGestureOrigin::App {
-            apps.extend(self.active_app_pid());
-        }
+        apps.extend(self.touch_state.primary_target.take());
         apps.sort_unstable_by_key(|pid| pid.get());
         apps.dedup();
-
         for pid in apps {
-            if let Some(window) = self.windows.get(&pid) {
-                xous::try_send_message(
-                    window.input_cid,
-                    xous::Message::new_scalar(InputMessage::TouchCancel as usize, 0, 0, 0, 0),
-                )
-                .ok();
-            }
+            self.send_touch_cancel(pid);
         }
 
         self.touch_state.secondary_touches = [(None, 0, 0); 16];

@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use gui_server_api::msg::{
-    AnimateNextFrame, CloseApp, IsLocked, RequestAppClose, RequestRedraw, SetControlCenterColor, Shutdown,
+    AnimateNextFrame, CloseApp, EnableMultitouch, IsLocked, RequestAppClose, RequestRedraw, SetControlCenterColor,
+    Shutdown,
     SwitchTo, SwitchToLauncher, UpdateKioskPolicy,
 };
 use log::{error, info, warn};
@@ -114,6 +115,15 @@ impl ScalarHandler<RequestRedraw> for Gui {
             window.buffers.buffer_requested(self.last_vsync_time);
         } else {
             log::error!("RequestRedraw from unknown PID={sender}");
+        }
+    }
+}
+
+impl ScalarHandler<EnableMultitouch> for Gui {
+    fn handle(&mut self, _msg: EnableMultitouch, sender: PID, _context: &mut ServerContext<Self>) {
+        match self.windows.get_mut(&sender) {
+            Some(window) => window.multitouch = true,
+            None => log::error!("EnableMultitouch from unknown PID={sender}"),
         }
     }
 }

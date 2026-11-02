@@ -346,6 +346,15 @@ impl<P: CheckedPermissions> GuiApi<P> {
         Ok(())
     }
 
+    /// See [`msg::EnableMultitouch`].
+    pub fn enable_multitouch(&self) -> Result<(), GuiServerError>
+    where
+        P: MessageAllowed<msg::EnableMultitouch>,
+    {
+        self.conn.try_send_scalar(msg::EnableMultitouch)?;
+        Ok(())
+    }
+
     pub fn try_receive_input(&self) -> Option<(InputMessage, xous::MessageEnvelope)> {
         if let Ok(Some(msg)) = xous::try_receive_message(self.sid) {
             let opcode = FromPrimitive::from_usize(msg.body.id());

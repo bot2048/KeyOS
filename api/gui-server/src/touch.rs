@@ -27,9 +27,10 @@ impl Touch {
 
     #[must_use]
     pub fn with_offset(&self, offset_x: i32, offset_y: i32) -> Touch {
+        // Clamped to 0, or else a touch at the top edge would wrap around to a huge coordinate
         Touch {
-            x: (self.x as i32).saturating_add(offset_x) as usize,
-            y: (self.y as i32).saturating_add(offset_y) as usize,
+            x: (self.x as i32).saturating_add(offset_x).max(0) as usize,
+            y: (self.y as i32).saturating_add(offset_y).max(0) as usize,
             ..*self
         }
     }

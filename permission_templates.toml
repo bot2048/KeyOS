@@ -47,6 +47,7 @@
 "os/gui-server" = [
     "RegisterAppMessage",
     "RequestRedraw",
+    "EnableMultitouch",
     "AnimateNextFrame",
     "SubmitFrame",
     "UpdateKeyboard",

@@ -7,6 +7,10 @@
 //! than released, and no press or click happens until all fingers are lifted, so that multi-finger
 //! touches never activate a button by accident. Two fingers make pinch and rotation gestures, which
 //! `ScaleRotateGestureHandler` turns into a scale and a rotation.
+//!
+//! A finger resting on a side edge is likely the hand holding the device. If it is the pointer when
+//! another finger lands, it is dropped instead, and the other finger becomes the pointer, or else every
+//! tap would count as a second finger while the hand holds the device.
 
 use i_slint_core::{
     graphics::euclid,
@@ -21,8 +25,15 @@ const PINCH_SLOP: f32 = 24.0;
 /// Angle change (in degrees) before two fingers make a rotation.
 const ROTATION_SLOP_DEGREES: f32 = 10.0;
 
-#[derive(Default)]
+/// Width of the strips along the left and right edges (about 1.7 mm) where a resting finger can be a grip.
+const GRIP_EDGE_MARGIN: f32 = 16.0;
+
+/// A finger that moved further than this (in logical pixels) since it landed is not resting.
+const GRIP_SLOP: f32 = 24.0;
+
 pub(crate) struct TouchRecognizer {
+    /// Width of the window, to tell where its side edges are.
+    width: f32,
     fingers: Vec<Finger>,
     mode: Mode,
     /// A finger moved since the last pointer or gesture event.
@@ -33,6 +44,16 @@ pub(crate) struct TouchRecognizer {
 struct Finger {
     id: i32,
     position: LogicalPoint,
+    start: LogicalPoint,
+    /// Taken to be the hand holding the device, and left out of everything until lifted.
+    grip: bool,
+}
+
+impl Finger {
+    fn is_resting_on_side_edge(&self, width: f32) -> bool {
+        (self.start.x < GRIP_EDGE_MARGIN || self.start.x >= width - GRIP_EDGE_MARGIN)
+            && (self.position - self.start).length() <= GRIP_SLOP
+    }
 }
 
 #[derive(Default)]
@@ -53,6 +74,10 @@ enum Gesture {
 }
 
 impl TouchRecognizer {
+    pub(crate) fn new(width: f32) -> Self {
+        Self { width, fingers: Vec::new(), mode: Mode::Idle, moved: false }
+    }
+
     /// Processes a touch of a finger. Moves are only applied with the next [`Self::flush`] or touch of
     /// another kind, so that a batch of moves results in a single pointer or gesture update.
     pub(crate) fn touch(
@@ -124,9 +149,26 @@ impl TouchRecognizer {
             self.moved = true;
             return;
         }
-        self.fingers.push(Finger { id, position });
+        self.fingers.push(Finger { id, position, start: position, grip: false });
 
         match self.mode {
+            Mode::Pointer { id: pointer_id }
+                if self.finger(pointer_id).is_some_and(|f| f.is_resting_on_side_edge(self.width)) =>
+            {
+                // The pointer is the hand holding the device: drop it without a click, and take the new
+                // finger as the pointer
+                if let Some(grip) = self.fingers.iter_mut().find(|f| f.id == pointer_id) {
+                    grip.grip = true;
+                }
+                out(MouseEvent::Exit);
+                self.mode = Mode::Pointer { id };
+                out(MouseEvent::Pressed {
+                    position,
+                    button: PointerEventButton::Left,
+                    click_count: 0,
+                    touch_finger_id: id + 1,
+                });
+            }
             Mode::Idle => {
                 self.mode = Mode::Pointer { id };
                 out(MouseEvent::Pressed {
@@ -150,6 +192,10 @@ impl TouchRecognizer {
     fn ended(&mut self, id: i32, out: &mut impl FnMut(MouseEvent)) {
         let Some(index) = self.fingers.iter().position(|f| f.id == id) else { return };
         let finger = self.fingers[index];
+        if finger.grip {
+            self.fingers.remove(index);
+            return;
+        }
 
         match self.mode {
             Mode::Idle => {}
@@ -178,7 +224,7 @@ impl TouchRecognizer {
         }
 
         self.fingers.remove(index);
-        if self.fingers.is_empty() && matches!(self.mode, Mode::Multi(_)) {
+        if self.fingers.iter().all(|f| f.grip) && matches!(self.mode, Mode::Multi(_)) {
             out(MouseEvent::Exit);
             self.mode = Mode::Idle;
         }
@@ -186,7 +232,8 @@ impl TouchRecognizer {
 
     /// A new gesture between the first two fingers that are down, if there are two.
     fn pending_gesture(&self) -> Gesture {
-        let [a, b, ..] = self.fingers[..] else { return Gesture::None };
+        let mut fingers = self.fingers.iter().filter(|f| !f.grip);
+        let (Some(a), Some(b)) = (fingers.next(), fingers.next()) else { return Gesture::None };
         let ids = (a.id, b.id);
         match self.geometry(ids) {
             Some((distance, angle)) => Gesture::Pending { ids, distance, angle },
@@ -291,7 +338,7 @@ mod tests {
 
     #[test]
     fn single_finger_is_the_pointer() {
-        let mut r = TouchRecognizer::default();
+        let mut r = TouchRecognizer::new(480.);
         assert_eq!(
             run(&mut r, &[(0, 1., 1., Started), (0, 2., 2., Moved), (0, 3., 3., Moved), (0, 3., 3., Ended)]),
             [E::Pressed(1., 1.), E::Moved(3., 3.), E::Released(3., 3.), E::Exit]
@@ -300,7 +347,7 @@ mod tests {
 
     #[test]
     fn second_finger_cancels_the_press_and_nothing_clicks_until_all_fingers_are_up() {
-        let mut r = TouchRecognizer::default();
+        let mut r = TouchRecognizer::new(480.);
         assert_eq!(run(&mut r, &[(0, 100., 100., Started), (1, 200., 100., Started)]), [E::Pressed(100., 100.), E::Exit]);
         // Lifting one finger and then the other never releases the pointer
         assert_eq!(run(&mut r, &[(1, 200., 100., Ended)]), []);
@@ -311,7 +358,7 @@ mod tests {
 
     #[test]
     fn pinch_scale_follows_the_fingers() {
-        let mut r = TouchRecognizer::default();
+        let mut r = TouchRecognizer::new(480.);
         let mut scale = 1.0f32;
         let mut started = false;
         let mut out = |e: MouseEvent| {
@@ -337,7 +384,7 @@ mod tests {
 
     #[test]
     fn gesture_needs_slop_and_ends_without_a_press() {
-        let mut r = TouchRecognizer::default();
+        let mut r = TouchRecognizer::new(480.);
         run(&mut r, &[(0, 100., 400., Started), (1, 200., 400., Started)]);
         assert_eq!(run(&mut r, &[(1, 210., 400., Moved)]), []);
         assert_eq!(run(&mut r, &[(1, 240., 400., Moved)]), [E::Pinch(Started), E::Rotation(Started)]);
@@ -349,7 +396,7 @@ mod tests {
 
     #[test]
     fn cancel_never_releases() {
-        let mut r = TouchRecognizer::default();
+        let mut r = TouchRecognizer::new(480.);
         run(&mut r, &[(0, 1., 1., Started)]);
         assert_eq!(run(&mut r, &[(0, 0., 0., Cancelled)]), [E::Exit]);
 
@@ -364,10 +411,33 @@ mod tests {
 
     #[test]
     fn pressing_a_finger_that_is_down_does_not_press_again() {
-        let mut r = TouchRecognizer::default();
+        let mut r = TouchRecognizer::new(480.);
         assert_eq!(
             run(&mut r, &[(0, 1., 1., Started), (0, 4., 4., Started), (0, 4., 4., Ended)]),
             [E::Pressed(1., 1.), E::Moved(4., 4.), E::Released(4., 4.), E::Exit]
         );
+    }
+
+    #[test]
+    fn finger_resting_on_a_side_edge_is_dropped_for_a_new_one() {
+        let mut r = TouchRecognizer::new(480.);
+        // A thumb holding the device on the right edge, then a tap in the middle
+        assert_eq!(run(&mut r, &[(0, 475., 400., Started)]), [E::Pressed(475., 400.)]);
+        assert_eq!(run(&mut r, &[(1, 240., 300., Started)]), [E::Exit, E::Pressed(240., 300.)]);
+        assert_eq!(run(&mut r, &[(1, 240., 300., Ended)]), [E::Released(240., 300.), E::Exit]);
+        // Taps keep working while the thumb rests, and the thumb lifts silently
+        assert_eq!(run(&mut r, &[(1, 100., 100., Started), (1, 100., 100., Ended)]), [
+            E::Pressed(100., 100.),
+            E::Released(100., 100.),
+            E::Exit
+        ]);
+        assert_eq!(run(&mut r, &[(0, 475., 400., Ended)]), []);
+    }
+
+    #[test]
+    fn finger_that_moved_away_from_the_edge_is_not_a_grip() {
+        let mut r = TouchRecognizer::new(480.);
+        run(&mut r, &[(0, 5., 400., Started), (0, 100., 400., Moved)]);
+        assert_eq!(run(&mut r, &[(1, 240., 300., Started)]), [E::Exit]);
     }
 }

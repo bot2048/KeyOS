@@ -114,7 +114,7 @@ server::permission_set!(pub trait GuiAppFsPermissions {
 server::permission_set!(pub trait GuiAppGuiPermissions {
     gui_server_api::msg::SubmitFrame, gui_server_api::msg::UpdateKeyboard,
     gui_server_api::msg::HideKeyboard, gui_server_api::msg::AnimateNextFrame,
-    gui_server_api::msg::RequestRedraw
+    gui_server_api::msg::RequestRedraw, gui_server_api::msg::EnableMultitouch
 });
 
 pub struct KeyOsPlatform<const WIDTH: usize, const HEIGHT: usize, PG: GuiAppGuiPermissions> {
@@ -132,6 +132,11 @@ impl<const WIDTH: usize, const HEIGHT: usize, PG: GuiAppGuiPermissions> KeyOsPla
         let pending_fonts = RefCell::new(crate::fonts::register_fonts(&cx.fs));
 
         let wake_callback = TicktimerCallback::new(cx.gui.sid()).unwrap();
+
+        // The touch recognizer handles several fingers and cancellation
+        if let Err(e) = cx.gui.enable_multitouch() {
+            log::warn!("Could not enable multitouch: {e:?}");
+        }
         Self {
             start: Instant::now(),
             pending_fonts,
@@ -148,7 +153,9 @@ impl<const WIDTH: usize, const HEIGHT: usize, PG: GuiAppGuiPermissions> KeyOsPla
                 config: cx.config.clone(),
 
                 swipe_gesture_state: None,
-                touch_recognizer: TouchRecognizer::default(),
+                touch_recognizer: TouchRecognizer::new(WIDTH as f32),
+                primary_touch: None,
+                swipe_abandoned: false,
                 ticktimer: Ticktimer::default(),
                 framebuffer: None,
             }),
@@ -240,6 +247,10 @@ struct KeyOsEventLoopState<const WIDTH: usize, const HEIGHT: usize, PG: GuiAppGu
     swipe_gesture_state: Option<(Instant, Touch, bool)>,
 
     touch_recognizer: TouchRecognizer,
+    /// Last touch of the first finger.
+    primary_touch: Option<Touch>,
+    /// The swipe back gesture gave up on the first finger, which is ignored until lifted.
+    swipe_abandoned: bool,
 
     ticktimer: Ticktimer,
     framebuffer: Option<Framebuffer>,
@@ -321,9 +332,22 @@ impl<const WIDTH: usize, const HEIGHT: usize, PG: GuiAppGuiPermissions>
         match event {
             InputMessage::Touch => {
                 if let Some(touch) = Touch::try_from_input_message(&msg.body) {
-                    // The swipe back gesture follows the first finger only, and owns it while it lasts
-                    if touch.id != 0 && self.swipe_gesture_state.is_some() {
-                        return;
+                    if touch.id == 0 {
+                        self.primary_touch = Some(touch);
+                        if self.swipe_abandoned {
+                            self.swipe_abandoned = !touch.is_release();
+                            return;
+                        }
+                    } else if let Some((_, first_touch, press_consumed)) = self.swipe_gesture_state {
+                        // The swipe back gesture follows the first finger only, and owns it while it lasts.
+                        // If that finger rests where it landed, it is more likely the hand holding the
+                        // device, so give up on the swipe instead of on all other fingers.
+                        let resting = self.primary_touch.is_some_and(|t| t.distance_to(&first_touch) <= 24.);
+                        if !(resting && press_consumed) {
+                            return;
+                        }
+                        self.swipe_gesture_state = None;
+                        self.swipe_abandoned = true;
                     }
                     if touch.id == 0 && self.config.enable_swipe_back.get() {
                         let can_go_back = self.router.with(|r| r.has_back());
@@ -364,10 +388,12 @@ impl<const WIDTH: usize, const HEIGHT: usize, PG: GuiAppGuiPermissions>
                 self.visible = false;
                 // We won't see the fingers that are down now lifted
                 self.swipe_gesture_state = None;
+                self.swipe_abandoned = false;
                 events.push(PendingEvent::TouchCancel);
             }
             InputMessage::TouchCancel => {
                 self.swipe_gesture_state = None;
+                self.swipe_abandoned = false;
                 events.push(PendingEvent::TouchCancel);
             }
             InputMessage::CloseRequested => Runtime::unsafe_quit(),

@@ -26,6 +26,11 @@ impl FromScalar<3> for SwitchTo {
 #[derive(Debug, server::Message)]
 pub struct RequestRedraw;
 
+/// Tells the gui-server that the sending app handles touches of several fingers (`Touch::id` > 0) and
+/// `InputMessage::TouchCancel`. Apps that don't send it only get the touches of the first finger.
+#[derive(Debug, server::Message)]
+pub struct EnableMultitouch;
+
 /// Sets the background color of the collapsed Control Center while the sending
 /// app is visible.
 /// `None` restores the system theme color.

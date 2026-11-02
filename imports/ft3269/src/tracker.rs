@@ -6,6 +6,13 @@
 //! a finger that is already down. Instead, frames are compared by touch id: a finger that is missing
 //! from a frame is released, and a finger that appears is pressed.
 //!
+//! A finger that is missing from a frame right after one it was in is released. If we lost track of it
+//! instead (frames were lost in between, or the controller gives its id to a new contact), it is
+//! cancelled, since it was lifted some time ago and maybe somewhere else than where we last saw it.
+//!
+//! After the controller is reset, fingers that are already touching are ignored until all are lifted,
+//! so that touching the screen while it wakes up doesn't press anything.
+//!
 //! A contact also has to be seen in two consecutive frames before it is pressed, so that noise that shows
 //! up as a contact for a single frame can't tap anything. While a finger is down the controller reports it
 //! on every scan, so this delays a press by one scan.
@@ -79,6 +86,8 @@ pub enum TouchEventKind {
     Press,
     Drag,
     Release,
+    /// The finger is gone, but must not activate anything.
+    Cancel,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,8 +109,8 @@ impl TouchEvent {
         Self { kind, id, x: point.x, y: point.y, weight: point.weight, area: point.area }
     }
 
-    fn release(finger: DownFinger) -> Self {
-        Self { kind: TouchEventKind::Release, id: finger.id, x: finger.x, y: finger.y, weight: 0, area: 0 }
+    fn gone(kind: TouchEventKind, finger: DownFinger) -> Self {
+        Self { kind, id: finger.id, x: finger.x, y: finger.y, weight: 0, area: 0 }
     }
 }
 
@@ -115,6 +124,10 @@ pub struct FrameTracker {
     down: [Option<DownFinger>; MAX_POINTS],
     /// Contacts seen in the last frame only, indexed by the controller's touch id.
     candidates: [bool; MAX_POINTS],
+    /// A frame was lost since the last one.
+    frame_lost: bool,
+    /// Contacts are ignored until a frame without any.
+    wait_for_lift: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -128,13 +141,23 @@ impl FrameTracker {
     /// Compares `frame` to the previous one and emits the releases, then the drags, then the presses
     /// that lead from one to the other.
     pub fn update(&mut self, frame: &Frame, mut emit: impl FnMut(TouchEvent)) {
+        let frame_lost = core::mem::take(&mut self.frame_lost);
+        if self.wait_for_lift {
+            self.wait_for_lift = frame.points.iter().any(Option::is_some);
+            return;
+        }
+
         for (down, point) in self.down.iter_mut().zip(&frame.points) {
             if let Some(finger) = *down {
-                // A new contact under a known id means that we missed the old one being lifted
-                if point.map_or(true, |p| p.new) {
-                    emit(TouchEvent::release(finger));
-                    *down = None;
-                }
+                let kind = match point {
+                    None if !frame_lost => TouchEventKind::Release,
+                    None => TouchEventKind::Cancel,
+                    // A new contact under a known id means that we missed the old one being lifted
+                    Some(p) if p.new => TouchEventKind::Cancel,
+                    Some(_) => continue,
+                };
+                emit(TouchEvent::gone(kind, finger));
+                *down = None;
             }
         }
 
@@ -161,14 +184,16 @@ impl FrameTracker {
         }
     }
 
-    /// Forgets all fingers, emitting a release for each, e.g. when the controller is reset or put to sleep.
-    pub fn release_all(&mut self, mut emit: impl FnMut(TouchEvent)) {
-        self.candidates = Default::default();
-        for down in &mut self.down {
-            if let Some(finger) = down.take() {
-                emit(TouchEvent::release(finger));
-            }
-        }
+    /// To be called when a frame couldn't be read, or was invalid.
+    pub fn frame_lost(&mut self) { self.frame_lost = true; }
+
+    /// A tracker for a controller that was just reset: it forgets all fingers, and ignores the ones that
+    /// are touching until they are lifted.
+    pub fn after_reset() -> Self { Self { wait_for_lift: true, ..Self::default() } }
+
+    /// Whether any finger is down or about to be pressed.
+    pub fn is_touched(&self) -> bool {
+        self.wait_for_lift || self.down.iter().any(Option::is_some) || self.candidates.contains(&true)
     }
 
     fn free_id(&self) -> u8 {
@@ -224,14 +249,29 @@ mod tests {
     }
 
     #[test]
-    fn missed_lift_is_released_on_the_next_frame() {
+    fn missed_lift_is_cancelled() {
         let mut t = FrameTracker::default();
         run2(&mut t, Frame::with(&[(0, 10, 20, true)]));
         // The lift-up frame was lost, and the next frames are a new finger under the same id
         assert_eq!(
             run2(&mut t, Frame::with(&[(0, 100, 200, true)])),
-            [(Release, 0, 10, 20), (Press, 0, 100, 200)]
+            [(Cancel, 0, 10, 20), (Press, 0, 100, 200)]
         );
+
+        // A frame was lost, and the finger is gone in the next one
+        t.frame_lost();
+        assert_eq!(run(&mut t, Frame::default()), [(Cancel, 0, 100, 200)]);
+    }
+
+    #[test]
+    fn fingers_touching_after_a_reset_are_ignored_until_lifted() {
+        let mut t = FrameTracker::after_reset();
+        assert!(t.is_touched());
+        assert_eq!(run2(&mut t, Frame::with(&[(0, 10, 20, true)])), []);
+        assert_eq!(run2(&mut t, Frame::with(&[(0, 15, 20, false), (1, 50, 50, true)])), []);
+        assert_eq!(run(&mut t, Frame::default()), []);
+        assert!(!t.is_touched());
+        assert_eq!(run2(&mut t, Frame::with(&[(1, 50, 50, true)])), [(Press, 0, 50, 50)]);
     }
 
     #[test]
@@ -270,15 +310,15 @@ mod tests {
     }
 
     #[test]
-    fn release_all() {
+    fn is_touched() {
         let mut t = FrameTracker::default();
-        run2(&mut t, Frame::with(&[(0, 10, 10, true), (1, 20, 20, true)]));
-        run(&mut t, Frame::with(&[(0, 10, 10, false), (1, 20, 20, false), (2, 5, 5, true)]));
-        let mut events = Vec::new();
-        t.release_all(|e| events.push((e.kind, e.id)));
-        assert_eq!(events, [(Release, 0), (Release, 1)]);
-        // The contact that was only seen once is forgotten too
-        assert_eq!(run(&mut t, Frame::with(&[(2, 5, 5, false)])), []);
+        assert!(!t.is_touched());
+        run(&mut t, Frame::with(&[(0, 10, 10, true)]));
+        assert!(t.is_touched());
+        run(&mut t, Frame::with(&[(0, 10, 10, false)]));
+        assert!(t.is_touched());
+        run(&mut t, Frame::default());
+        assert!(!t.is_touched());
     }
 
     fn raw(count: u8, points: &[[u8; 6]]) -> [u8; FRAME_LEN] {

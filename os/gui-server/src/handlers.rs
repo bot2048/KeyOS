@@ -83,6 +83,10 @@ pub struct PowerButtonTimerCallback;
 #[derive(Debug, server::Message)]
 pub struct AutoLockTimerCallback(pub AutoLockStep);
 
+#[cfg(keyos)]
+#[derive(Debug, server::Message)]
+pub struct TouchPollTimerCallback;
+
 #[derive(Debug, PartialEq, num_derive::FromPrimitive, num_derive::ToPrimitive, Copy, Clone)]
 pub enum AutoLockStep {
     Dim,

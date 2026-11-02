@@ -111,6 +111,8 @@ pub struct AppWindow {
     #[cfg(not(feature = "recovery-os"))]
     camera_state: crate::camera::CameraState,
     notified_shown: bool,
+    /// The app handles touches of several fingers and touch cancellation.
+    multitouch: bool,
 }
 
 impl Drop for AppWindow {
@@ -296,6 +298,8 @@ impl Server for Gui {
         }
 
         self.init_auto_lock(context);
+        #[cfg(keyos)]
+        self.init_touch(context);
 
         PowerManagerExtApi::default().subscribe_battery_critical(context);
 
@@ -440,6 +444,7 @@ impl Gui {
                 input_cid: msg.cid,
                 buffers: BufferChain::new(msg.cid, u16::try_from(SCREEN_HEIGHT).unwrap(), pid),
                 notified_shown: false,
+                multitouch: false,
             },
         );
         let name = msg.name.clone();

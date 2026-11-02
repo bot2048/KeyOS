@@ -34,6 +34,7 @@ UpdateKioskPolicy = { id = 58, type = "scalar", approval = "autoAllow" }
 IsLocked = { id = 59, type = "blockingScalar" }
 InjectPowerButton = { id = 60, type = "scalar" }
 SetControlCenterColor = { id = 61, type = "scalar", permissionGroup = "ui-and-input.control-center-appearance", approval = "autoAllow" }
+EnableMultitouch = { id = 62, type = "scalar", permissionGroup = "ui-and-input.app-surface", approval = "autoAllow" }
 
 # Privileged registrations
 ClaimAlertsRole = { id = 120, type = "blockingScalar", approval = "autoAllow" }

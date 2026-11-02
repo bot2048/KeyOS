@@ -15,6 +15,7 @@ CloseAppTimeout = { id = 25, type = "scalar" }
 BlurDone = { id = 26, type = "scalar" }
 PowerButtonTimerCallback = { id = 42, type = "scalar" }
 AutoLockTimerCallback = { id = 43, type = "scalar" }
+TouchPollTimerCallback = { id = 67, type = "scalar", cfg = "keyos" }
 ForceShutdownTimeout = { id = 50, type = "scalar" }
 PermissionRequest = { id = 66, type = "scalar", cfg = 'not(feature = "recovery-os")' }
 
