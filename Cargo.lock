@@ -14378,6 +14378,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "42ff0bf0c66b8238c6f3b578df37d0b7848e55df8577b3f74f92a69acceeb825"
 
 [[package]]
+name = "uac"
+version = "0.1.0"
+
+[[package]]
 name = "udev"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

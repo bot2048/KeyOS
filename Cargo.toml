@@ -57,6 +57,7 @@ members = [
     "imports/getrandom",
     "imports/prepare-release/prepare-release-bin",
     "imports/securam-manager",
+    "imports/uac",
     "integration-tests/keyos-integration-test",
     "integration-tests/ordered-table-test",
     "integration-tests/settings-test-client",
@@ -256,6 +257,7 @@ qbsdiff = { path = "imports/qbsdiff", default-features = false }
 softbuffer = { path = "imports/softbuffer" }
 tar = { path = "imports/tar-rs" }
 tusb320 = { path = "imports/tusb320" }
+uac = { path = "imports/uac" }
 
 # common deps 
 anyhow = "1.0"

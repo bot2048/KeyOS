@@ -1,0 +1,11 @@
+# SPDX-FileCopyrightText: 2026 Arpan Jain
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+[package]
+name = "uac"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "USB Audio Class 1 and 2 descriptor parsing, format selection and request builders for a USB host"
+
+[dependencies]
