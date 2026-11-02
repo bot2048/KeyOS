@@ -26,6 +26,14 @@ const NO_FRAME: [u8; FRAME_LEN] = [0xaa; FRAME_LEN];
 /// After this many reads in a row fail (about a second of polling), the controller is reset.
 const MAX_READ_FAILURES: u32 = 20;
 
+/// After this many resets in a row that didn't help, we stop polling and wait for an interrupt instead.
+const MAX_RESETS: u32 = 3;
+
+/// While a finger is down the controller reports it on every scan, so a longer time between two reads
+/// means that we missed scans (we were busy, or reads failed). A finger can't be lifted and put down
+/// elsewhere in less time.
+const MISSED_SCANS_TIME: Duration = Duration::from_millis(60);
+
 i2c::use_api!();
 
 pub(crate) struct HwTouchState {
@@ -38,7 +46,12 @@ pub(crate) struct HwTouchState {
     quiet_until: Option<Instant>,
     /// The last frame read, to tell reading the same scan again from a new one.
     last_frame: [u8; FRAME_LEN],
+    /// The last valid frame read had touch points.
+    last_frame_touched: bool,
+    /// When the controller was last read successfully.
+    last_read: Option<Instant>,
     read_failures: u32,
+    resets: u32,
 }
 
 impl Default for HwTouchState {
@@ -64,7 +77,10 @@ impl Default for HwTouchState {
             poll_callback: None,
             quiet_until: None,
             last_frame: NO_FRAME,
+            last_frame_touched: false,
+            last_read: None,
             read_failures: 0,
+            resets: 0,
         }
     }
 }
@@ -101,6 +117,8 @@ impl HwTouchState {
 
         self.tracker = FrameTracker::after_reset();
         self.last_frame = NO_FRAME;
+        self.last_frame_touched = false;
+        self.last_read = None;
         self.read_failures = 0;
         self.start_quiet_time();
     }
@@ -113,39 +131,45 @@ impl HwTouchState {
         }
     }
 
-    /// Reads a frame. Returns `None` for a failed read, or for a frame that can't be trusted.
+    /// Reads a frame. Returns `Ok(None)` when the controller reports the same scan again, and `Err` for a
+    /// failed read or a frame that can't be trusted.
     fn read_frame(&mut self) -> Result<Option<Frame>, ()> {
-        let data = match self.ft3269.read_frame() {
-            Ok(data) => data,
-            Err(e) => {
-                self.read_failures += 1;
-                if self.read_failures == 1 {
-                    log::warn!("Could not read touch frame: {e:?}");
-                }
+        let result = self.ft3269.read_frame().map_err(|e| log::debug!("Could not read touch frame: {e:?}"));
+        let frame = result.and_then(|data| {
+            // A real lift is reported with the lifted points, so a frame of only zeroes is a failed read
+            if data.iter().all(|&b| b == 0) && self.tracker.has_fingers_down() {
                 return Err(());
             }
-        };
-        self.read_failures = 0;
+            // Reading the same scan again (we were slow to handle the interrupts, or the poll came first)
+            // tells nothing new, and must not count as another frame for the press debounce.
+            if data == self.last_frame {
+                return Ok(None);
+            }
+            let frame = Frame::parse(&data).ok_or_else(|| log::debug!("Skipping an invalid touch frame"))?;
+            self.last_frame = data;
+            self.last_frame_touched = frame != Frame::default();
+            Ok(Some(frame))
+        });
 
-        // Reading the same scan again (we were slow to handle the interrupts, or the poll came first)
-        // tells nothing new, and must not count as another frame for the press debounce.
-        if data == self.last_frame {
-            return Ok(None);
-        }
-        self.last_frame = data;
-
-        // A real lift is reported with the lifted points, so a frame of only zeroes is a failed read
-        if data.iter().all(|&b| b == 0) && self.tracker.has_fingers_down() {
-            return Err(());
-        }
-
-        match Frame::parse(&data) {
-            Some(frame) => Ok(Some(frame)),
-            None => {
-                log::debug!("Skipping an invalid touch frame");
-                Err(())
+        match frame {
+            Ok(_) => {
+                self.read_failures = 0;
+                self.resets = 0;
+                let now = Instant::now();
+                if self.last_read.is_some_and(|last| now - last > MISSED_SCANS_TIME) && self.tracker.has_fingers_down()
+                {
+                    self.tracker.frame_lost();
+                }
+                self.last_read = Some(now);
+            }
+            Err(()) => {
+                self.read_failures += 1;
+                if self.read_failures == 1 {
+                    log::warn!("Could not read a valid touch frame");
+                }
             }
         }
+        frame
     }
 }
 
@@ -164,7 +188,13 @@ impl Gui {
             return;
         }
         if let Some(quiet_until) = hw_state.quiet_until {
-            if Instant::now() < quiet_until {
+            let now = Instant::now();
+            if now < quiet_until {
+                // Make sure we read the controller at the end of the quiet time, even if a timer fired early
+                if let Some(callback) = &hw_state.poll_callback {
+                    let wait = (quiet_until - now).as_millis() as usize + 1;
+                    callback.request(wait, TouchPollTimerCallback::ID, 0);
+                }
                 return;
             }
             hw_state.quiet_until = None;
@@ -172,8 +202,21 @@ impl Gui {
 
         let frame = hw_state.read_frame();
         if hw_state.read_failures >= MAX_READ_FAILURES {
-            log::error!("The touch controller doesn't respond, resetting it");
-            hw_state.reset();
+            hw_state.resets += 1;
+            if hw_state.resets <= MAX_RESETS {
+                log::error!("The touch controller doesn't respond, resetting it");
+                hw_state.reset();
+            } else {
+                // Don't poll a broken controller forever: forget the fingers, and try again on the next
+                // interrupt
+                log::error!("The touch controller doesn't respond, waiting for an interrupt");
+                hw_state.tracker = FrameTracker::default();
+                hw_state.read_failures = 0;
+                hw_state.resets = 0;
+                if let Some(callback) = &hw_state.poll_callback {
+                    callback.cancel(TouchPollTimerCallback::ID);
+                }
+            }
             self.touch_cancel_all();
             self.touch_state.fingers_down = 0;
             return;
@@ -214,7 +257,8 @@ impl Gui {
             }
         }
 
-        if touches.is_empty() && touched {
+        let hw_state = &self.touch_state.hw_state;
+        if touches.is_empty() && frame.is_ok() && hw_state.last_frame_touched && hw_state.tracker.has_fingers_down() {
             // A finger resting on the screen keeps it awake, like a moving one does
             self.touch_keep_awake();
         }

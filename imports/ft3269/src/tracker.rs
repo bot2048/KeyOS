@@ -11,8 +11,9 @@
 //! cancelled, since it was lifted some time ago and maybe somewhere else than where we last saw it.
 //!
 //! A finger that moves further between two frames than any finger does is taken to be another finger
-//! that touched after we missed the first one being lifted (e.g. because we read the controller too late
-//! to see the scans in between), and is cancelled and pressed again.
+//! that touched after we missed the first one being lifted, and is cancelled. If frames were lost in
+//! between, a much shorter move is enough, since a finger lifted and put down elsewhere looks like a
+//! move then. Contacts cancelled this way are ignored until lifted.
 //!
 //! After the controller is reset, fingers that are already touching are ignored until all are lifted,
 //! so that touching the screen while it wakes up doesn't press anything.
@@ -121,6 +122,10 @@ impl TouchEvent {
 /// Furthest a finger moves between two frames (in pixels, about 32 mm): further is another finger.
 const MAX_FRAME_JUMP: u32 = 300;
 
+/// Furthest a finger moves (in pixels, about 5 mm) between two frames that had frames lost in between,
+/// before we take it for another finger.
+const MAX_LOST_FRAMES_JUMP: u32 = 48;
+
 /// Number of different ids `TouchEvent`s use: one more than the number of points, since id 0 is kept for
 /// the first finger.
 pub const NUM_EVENT_IDS: usize = MAX_POINTS + 1;
@@ -135,6 +140,8 @@ pub struct FrameTracker {
     frame_lost: bool,
     /// Contacts are ignored until a frame without any.
     wait_for_lift: bool,
+    /// Contacts we lost track of, ignored until they are lifted, indexed by the controller's touch id.
+    ignored: [bool; MAX_POINTS],
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -148,10 +155,11 @@ struct DownFinger {
 }
 
 impl DownFinger {
-    fn jumped_to(&self, point: &Point) -> bool {
+    fn jumped_to(&self, point: &Point, frame_lost: bool) -> bool {
+        let max = if frame_lost { MAX_LOST_FRAMES_JUMP } else { MAX_FRAME_JUMP };
         let dx = u32::from(self.x.abs_diff(point.x));
         let dy = u32::from(self.y.abs_diff(point.y));
-        dx * dx + dy * dy > MAX_FRAME_JUMP * MAX_FRAME_JUMP
+        dx * dx + dy * dy > max * max
     }
 }
 
@@ -165,14 +173,18 @@ impl FrameTracker {
             return;
         }
 
-        for (down, point) in self.down.iter_mut().zip(&frame.points) {
+        for ((down, point), ignored) in self.down.iter_mut().zip(&frame.points).zip(&mut self.ignored) {
+            *ignored &= point.is_some();
             if let Some(finger) = *down {
                 let kind = match point {
                     None if !frame_lost => TouchEventKind::Release,
                     None => TouchEventKind::Cancel,
                     // A new contact under a known id, or one far away, means that we missed the old one being
                     // lifted
-                    Some(p) if (p.new && finger.seen_contact) || finger.jumped_to(p) => TouchEventKind::Cancel,
+                    Some(p) if (p.new && finger.seen_contact) || finger.jumped_to(p, frame_lost) => {
+                        *ignored = true;
+                        TouchEventKind::Cancel
+                    }
                     Some(_) => continue,
                 };
                 emit(TouchEvent::gone(kind, finger));
@@ -191,6 +203,9 @@ impl FrameTracker {
         }
 
         for hw_id in 0..MAX_POINTS {
+            if self.ignored[hw_id] {
+                continue;
+            }
             match (self.down[hw_id], frame.points[hw_id]) {
                 (None, Some(point)) if self.candidates[hw_id] => {
                     self.candidates[hw_id] = false;
@@ -216,7 +231,10 @@ impl FrameTracker {
 
     /// Whether any finger is down or about to be pressed.
     pub fn is_touched(&self) -> bool {
-        self.wait_for_lift || self.down.iter().any(Option::is_some) || self.candidates.contains(&true)
+        self.wait_for_lift
+            || self.down.iter().any(Option::is_some)
+            || self.candidates.contains(&true)
+            || self.ignored.contains(&true)
     }
 
     fn free_id(&self) -> u8 {
@@ -272,19 +290,29 @@ mod tests {
     }
 
     #[test]
-    fn missed_lift_is_cancelled() {
+    fn missed_lift_is_cancelled_and_the_new_contact_ignored_until_lifted() {
         let mut t = FrameTracker::default();
         run(&mut t, Frame::with(&[(0, 10, 20, true)]));
         run(&mut t, Frame::with(&[(0, 10, 20, false)]));
         // The lift-up frame was lost, and the next frames are a new finger under the same id
-        assert_eq!(
-            run2(&mut t, Frame::with(&[(0, 100, 200, true)])),
-            [(Cancel, 0, 10, 20), (Press, 0, 100, 200)]
-        );
+        assert_eq!(run2(&mut t, Frame::with(&[(0, 100, 200, true)])), [(Cancel, 0, 10, 20)]);
+        assert!(t.is_touched());
+        assert_eq!(run(&mut t, Frame::default()), []);
+        assert_eq!(run2(&mut t, Frame::with(&[(0, 100, 200, true)])), [(Press, 0, 100, 200)]);
 
         // A frame was lost, and the finger is gone in the next one
         t.frame_lost();
         assert_eq!(run(&mut t, Frame::default()), [(Cancel, 0, 100, 200)]);
+    }
+
+    #[test]
+    fn short_jump_across_lost_frames_is_another_finger() {
+        let mut t = FrameTracker::default();
+        run2(&mut t, Frame::with(&[(0, 100, 400, false)]));
+        assert_eq!(run(&mut t, Frame::with(&[(0, 140, 400, false)])), [(Drag, 0, 140, 400)]);
+        t.frame_lost();
+        assert_eq!(run(&mut t, Frame::with(&[(0, 230, 400, false)])), [(Cancel, 0, 140, 400)]);
+        assert_eq!(run2(&mut t, Frame::with(&[(0, 240, 400, false)])), []);
     }
 
     #[test]
@@ -375,11 +403,11 @@ mod tests {
     fn jump_is_another_finger() {
         let mut t = FrameTracker::default();
         run2(&mut t, Frame::with(&[(0, 10, 400, true)]));
-        // Lift and touch again far away, without us seeing the scans in between
-        assert_eq!(run(&mut t, Frame::with(&[(0, 400, 400, false)])), [(Cancel, 0, 10, 400)]);
-        assert_eq!(run(&mut t, Frame::with(&[(0, 400, 400, false)])), [(Press, 0, 400, 400)]);
         // A fast but real move is a drag
         assert_eq!(run(&mut t, Frame::with(&[(0, 200, 400, false)])), [(Drag, 0, 200, 400)]);
+        // Lift and touch again far away, without us seeing the scans in between
+        assert_eq!(run(&mut t, Frame::with(&[(0, 200, 750, false)])), [(Cancel, 0, 200, 400)]);
+        assert_eq!(run2(&mut t, Frame::with(&[(0, 200, 750, false)])), []);
     }
 
     #[test]
