@@ -186,7 +186,11 @@ export component SlideToConfirm {
         }
 
         pointer-event(event) => {
-            if (event.kind == PointerEventKind.up || event.kind == PointerEventKind.cancel) {
+            // Only a finger lifted from the slider confirms. A cancel (the screen turning off, the app
+            // being hidden, a second finger landing) springs the slider back.
+            if (event.kind == PointerEventKind.cancel) {
+                root.drag-offset = 0px;
+            } else if (event.kind == PointerEventKind.up) {
                 if (root.drag-offset >= root.max-offset * 0.85) {
                     root.confirmed = true;
                     root.drag-offset = root.max-offset;

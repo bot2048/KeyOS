@@ -3,26 +3,20 @@
 
 use std::time::Duration;
 
-use ft3269::{Ft3269, PowerMode, Touch as FtTouch, TouchKind as FtTouchKind};
+use ft3269::{Ft3269, FrameTracker, PowerMode, TouchEventKind};
 use gpio::{GpioApi, GpioPin};
-use gui_server_api::{
-    consts::SCREEN_HEIGHT,
-    touch::{Touch, TouchKind},
-};
+use gui_server_api::touch::{Touch, TouchKind};
 use i2c::Peripheral;
 
 use crate::{gpio::GpioPermissions, Gui};
 
 i2c::use_api!();
 
-// The release event is sent wrong by the touch controller, it is off by this much if the release is within
-// the virutal button area.
-const VIRT_BUTTON_RELEASE_OFFSET: u16 = 36;
-
 pub(crate) struct HwTouchState {
     ft3269: ft3269::Ft3269<I2cPeripheral>,
     gpio_api: GpioApi<GpioPermissions>,
     enabled: bool,
+    tracker: FrameTracker,
 }
 
 impl Default for HwTouchState {
@@ -43,6 +37,7 @@ impl Default for HwTouchState {
             gpio_api,
             // The bootloader resets and enables the controller for us
             enabled: true,
+            tracker: FrameTracker::default(),
         }
     }
 }
@@ -66,6 +61,8 @@ impl HwTouchState {
             log::error!("Error setting touch module state to Hibernate: {e:?}");
         }
         self.enabled = false;
+        // The fingers that are down now won't be reported as lifted. The gui-server cancels them for the apps.
+        self.tracker = FrameTracker::default();
     }
 }
 
@@ -76,31 +73,37 @@ impl Gui {
             return;
         }
 
-        let mut touch_buf: [FtTouch; 5] = [FtTouch::default(); 5];
-
-        if self.touch_state.hw_state.ft3269.touches(&mut touch_buf).is_ok() {
-            for touch in &touch_buf {
-                // Convert from hardware representation to ours, should it be any different
-                let kind = match touch.kind {
-                    FtTouchKind::Press => TouchKind::Press,
-                    FtTouchKind::Release => TouchKind::Release,
-                    FtTouchKind::Drag => TouchKind::Drag,
-                    FtTouchKind::Reserved => {
-                        // All others will be "Reserved" after this one.
-                        break;
-                    }
-                };
-
-                let y = if kind == TouchKind::Release && touch.y > SCREEN_HEIGHT as u16 {
-                    touch.y - VIRT_BUTTON_RELEASE_OFFSET
-                } else {
-                    touch.y
-                };
-
-                let touch = Touch { kind, id: touch.id as usize, x: touch.x as usize, y: y as usize };
-
-                self.touch_dispatch(touch, false);
+        let hw_state = &mut self.touch_state.hw_state;
+        let frame = match hw_state.ft3269.frame() {
+            Ok(Some(frame)) => frame,
+            // Skipping a frame is safe: the next one tells which fingers are down
+            Ok(None) => {
+                log::debug!("Skipping an invalid touch frame");
+                return;
             }
+            Err(e) => {
+                log::warn!("Could not read touch frame: {e:?}");
+                return;
+            }
+        };
+
+        // Releases are reported where the finger was last seen, since the controller reports wrong
+        // coordinates for lifts within the virtual button area.
+        let mut touches = Vec::with_capacity(ft3269::NUM_EVENT_IDS);
+        hw_state.tracker.update(&frame, |event| {
+            if event.kind == TouchEventKind::Press {
+                log::trace!("Touch {} pressed with weight {} and area {}", event.id, event.weight, event.area);
+            }
+            let kind = match event.kind {
+                TouchEventKind::Press => TouchKind::Press,
+                TouchEventKind::Drag => TouchKind::Drag,
+                TouchEventKind::Release => TouchKind::Release,
+            };
+            touches.push(Touch { kind, id: event.id as usize, x: event.x as usize, y: event.y as usize });
+        });
+
+        for touch in touches {
+            self.touch_dispatch(touch, false);
         }
     }
 }

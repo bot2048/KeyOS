@@ -17,6 +17,13 @@ use {
     },
 };
 
+/// Most fingers that touch the screen at once on purpose. More are taken to be a palm or a grip.
+const MAX_INTENTIONAL_TOUCHES: u32 = 3;
+
+/// Width of the strips along the left and right edges (about 1.7 mm) where fingers other than the first
+/// one are ignored.
+const SECONDARY_TOUCH_EDGE_MARGIN: usize = 16;
+
 pub(crate) struct TouchState {
     pub(crate) origin: TouchGestureOrigin,
     pub(crate) switcher_gesture_state: SwitcherGestureState,
@@ -29,6 +36,11 @@ pub(crate) struct TouchState {
 
     /// The app that the finger with id `n` (n > 0) is being forwarded to, and its last position.
     secondary_touches: [(Option<xous::PID>, usize, usize); 16],
+
+    /// Bit `n` is set while the finger with id `n` is down.
+    fingers_down: u16,
+    /// Set when more fingers touched than anyone would use on purpose, until they are all lifted.
+    palm_lockout: bool,
 }
 
 impl TouchState {
@@ -45,6 +57,8 @@ impl TouchState {
             last_x: 0,
             last_y: 0,
             secondary_touches: [(None, 0, 0); 16],
+            fingers_down: 0,
+            palm_lockout: false,
         }
     }
 }
@@ -72,6 +86,10 @@ impl Gui {
     /// but the touch is **not** swallowed — so a single tap is enough to interact
     /// with the device even when the screen has dimmed.
     pub fn touch_dispatch(&mut self, touch: Touch, injected: bool) {
+        if self.touch_palm_rejected(&touch) {
+            return;
+        }
+
         // Only the first finger drives system gestures, since the code below assumes a certain
         // Press->drag->release order. Further fingers go to the app that the first finger is in.
         if touch.id > 0 {
@@ -253,7 +271,34 @@ impl Gui {
         }
     }
 
-    /// Forwards a touch of a finger other than the first one to the active app, so that apps can
+    /// More fingers at once than anyone would use on purpose on this screen are a palm or a hand
+    /// gripping the device. Takes every touch away from the apps when that happens, and ignores the panel
+    /// until all fingers are lifted. Returns whether to ignore `touch`.
+    fn touch_palm_rejected(&mut self, touch: &Touch) -> bool {
+        let state = &mut self.touch_state;
+        let bit = 1u16.checked_shl(touch.id as u32).unwrap_or(0);
+        match touch.kind {
+            TouchKind::Press => state.fingers_down |= bit,
+            TouchKind::Drag => {}
+            TouchKind::Release => state.fingers_down &= !bit,
+        }
+
+        if !state.palm_lockout && state.fingers_down.count_ones() > MAX_INTENTIONAL_TOUCHES {
+            log::info!("Too many fingers on the touch panel, ignoring it until they are lifted");
+            state.palm_lockout = true;
+            self.touch_cancel_all();
+        }
+
+        let state = &mut self.touch_state;
+        if state.palm_lockout && state.fingers_down == 0 {
+            state.palm_lockout = false;
+            // This was the release of the last finger
+            return true;
+        }
+        state.palm_lockout
+    }
+
+    /// Forwards a touch of a finger other than the first one, so that apps can
     /// recognize multi-finger gestures. A finger is forwarded only if it lands while the first
     /// finger is in an unlocked app, and then to that same app until it is lifted, so that the app
     /// always sees the finger lifted again.
@@ -271,6 +316,14 @@ impl Gui {
             TouchKind::Press => {
                 self.touch_state.secondary_touches[touch.id].0 = None;
                 if is_locked || self.touch_state.origin != TouchGestureOrigin::App {
+                    return;
+                }
+                // A further finger that lands on the side edges is likely the hand holding the device,
+                // and one below the screen is on the virtual button rather than in the app.
+                if touch.x < SECONDARY_TOUCH_EDGE_MARGIN
+                    || touch.x >= SCREEN_WIDTH - SECONDARY_TOUCH_EDGE_MARGIN
+                    || touch.y >= SCREEN_HEIGHT
+                {
                     return;
                 }
                 let Some(pid) = self.active_app_pid() else { return };
@@ -302,12 +355,33 @@ impl Gui {
         #[cfg(keyos)]
         self.touch_state.hw_state.disable();
 
-        // The controller won't report the fingers that are down now as released, so do it here
-        for id in 1..self.touch_state.secondary_touches.len() {
-            let (target, x, y) = self.touch_state.secondary_touches[id];
-            if target.is_some() {
-                self.secondary_touch_dispatch(Touch { kind: TouchKind::Release, id, x, y }, false);
+        // The fingers that are down now won't be reported as lifted
+        self.touch_cancel_all();
+        self.touch_state.fingers_down = 0;
+        self.touch_state.palm_lockout = false;
+    }
+
+    /// Tells every app that fingers are touching that they were taken away, and forgets them.
+    fn touch_cancel_all(&mut self) {
+        let mut apps: Vec<xous::PID> =
+            self.touch_state.secondary_touches.iter().filter_map(|&(target, _, _)| target).collect();
+        if self.touch_state.origin == TouchGestureOrigin::App {
+            apps.extend(self.active_app_pid());
+        }
+        apps.sort_unstable_by_key(|pid| pid.get());
+        apps.dedup();
+
+        for pid in apps {
+            if let Some(window) = self.windows.get(&pid) {
+                xous::try_send_message(
+                    window.input_cid,
+                    xous::Message::new_scalar(InputMessage::TouchCancel as usize, 0, 0, 0, 0),
+                )
+                .ok();
             }
         }
+
+        self.touch_state.secondary_touches = [(None, 0, 0); 16];
+        self.touch_state.origin = TouchGestureOrigin::None;
     }
 }

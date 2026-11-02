@@ -433,6 +433,10 @@ pub enum InputMessage {
     /// Scalar args: arg1 = x (physical px), arg2 = y (physical px),
     ///              arg3 = delta_x (f32 bits), arg4 = delta_y (f32 bits).
     Scroll,
+
+    /// All fingers that are touching the app were taken away from it, e.g. because the screen was turned
+    /// off. Unlike a release, this must not activate anything.
+    TouchCancel,
 }
 
 #[derive(Debug, Copy, Clone)]

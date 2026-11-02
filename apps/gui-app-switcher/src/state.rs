@@ -100,6 +100,10 @@ impl AppState {
     }
 
     pub(crate) fn handle_touch(&mut self, ui: &AppWindow, gui_api: &Arc<GuiApi>, touch: Touch) {
+        // The card gestures follow the first finger only
+        if touch.id != 0 {
+            return;
+        }
         self.allow_enforce = matches!(touch.kind, TouchKind::Release);
 
         match touch.kind {

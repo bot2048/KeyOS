@@ -24,6 +24,7 @@ pub mod utilites;
 
 mod fonts;
 mod platform;
+mod touch;
 mod runtime;
 mod window;
 

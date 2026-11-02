@@ -2,8 +2,10 @@
 
 pub use crate::reg::{Dimensions, PowerMode, Status, Touch, TouchKind};
 use crate::reg::{Register, NUM_REGS_PER_TOUCH};
+pub use crate::tracker::{Frame, FrameTracker, TouchEvent, TouchEventKind, NUM_EVENT_IDS};
 
 mod reg;
+mod tracker;
 
 const FT3269_I2C_ADDRESS: u8 = 0x38;
 const FT3269_CHIP_ID: u8 = 0x79;
@@ -42,6 +44,16 @@ impl<I2C: embedded_hal::i2c::I2c> Ft3269<I2C> {
         }
 
         Ok(())
+    }
+
+    /// Reads the status register and all touch points in one transfer, so that they come from the same
+    /// frame. Returns `Ok(None)` if the frame can't be trusted.
+    pub fn frame(&mut self) -> Result<Option<Frame>, Ft3269Error<I2C::Error>> {
+        let mut buf = [0u8; tracker::FRAME_LEN];
+        self.i2c
+            .write_read(FT3269_I2C_ADDRESS, &[Register::Status as u8], &mut buf)
+            .map_err(Ft3269Error::I2cError)?;
+        Ok(Frame::parse(&buf))
     }
 
     pub fn dimensions(&mut self) -> Result<Dimensions, Ft3269Error<I2C::Error>> {
