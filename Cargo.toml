@@ -57,6 +57,7 @@ members = [
     "imports/getrandom",
     "imports/prepare-release/prepare-release-bin",
     "imports/securam-manager",
+    "imports/ohci",
     "imports/uac",
     "integration-tests/keyos-integration-test",
     "integration-tests/ordered-table-test",
@@ -251,6 +252,7 @@ ft3269 = { path = "imports/ft3269" }
 fuse = { path = "utils/fuse" }
 libblur = { path = "imports/libblur", default-features = false }
 ltr303 = { path = "imports/ltr303" }
+ohci = { path = "imports/ohci" }
 mass-storage = { path = "imports/mass-storage", features = ["rkyv"] }
 ovm7690-rs = { path = "imports/ovm7690-rs" }
 qbsdiff = { path = "imports/qbsdiff", default-features = false }

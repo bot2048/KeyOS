@@ -1,0 +1,11 @@
+[package]
+name = "ohci"
+version = "0.1.0"
+edition = "2021"
+description = "Simplified driver for the Open Host Controller Interface (USB 1.1 full and low speed)"
+
+[dependencies]
+bitfield = "0.15.0"
+ehci = { path = "../ehci" }
+log = "0.4.21"
+vcell = "0.1.3"

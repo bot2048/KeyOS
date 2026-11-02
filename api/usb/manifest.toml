@@ -8,6 +8,7 @@ BulkIn = { id = 5, type = "deferredLendMut" }
 IsConnected = { id = 8, type = "blockingScalar", permissionGroup = "device-connectivity.usb-host-status", approval = "autoAllow" }
 ControlTransfer = { id = 9, type = "blockingArchive" }
 ResetHostController = { id = 10, type = "scalar", approval = "autoAllow" }
+IsoOut = { id = 11, type = "deferredLendMut" }
 
 [servers."os/usbdev"]
 RegisterInterface = { id = 0, type = "blockingArchive" }

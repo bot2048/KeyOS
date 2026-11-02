@@ -12,6 +12,7 @@ default = ["settings"]
 
 [dependencies]
 ehci = { workspace = true, features = ["rkyv"] }
+ohci = { workspace = true }
 log = { workspace = true }
 log-server = { workspace = true }
 num-derive = { workspace = true }

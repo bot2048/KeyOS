@@ -9784,6 +9784,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ohci"
+version = "0.1.0"
+dependencies = [
+ "bitfield 0.15.0",
+ "ehci",
+ "log 0.4.27",
+ "vcell",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -14710,6 +14720,7 @@ dependencies = [
  "log 0.4.27",
  "num-derive",
  "num-traits",
+ "ohci",
  "power-manager",
  "rkyv",
  "server",

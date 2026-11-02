@@ -290,3 +290,49 @@ impl From<u8> for PidCode {
 impl From<PidCode> for u8 {
     fn from(value: PidCode) -> Self { value as u8 }
 }
+
+/// Isochronous transfer descriptor (EHCI 1.0 3.3): eight microframes of one high-speed
+/// isochronous endpoint.
+#[repr(C, align(32))]
+pub struct Itd {
+    pub next: VolatileCell<u32>,
+    pub transactions: [VolatileCell<ItdTransaction>; 8],
+    pub buffers: [VolatileCell<u32>; 7],
+}
+
+bitfield! {
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    pub struct ItdTransaction(u32);
+    impl Debug;
+
+    pub offset, set_offset: 11, 0;
+    pub page, set_page: 14, 12;
+    pub interrupt_on_complete, set_interrupt_on_complete: 15;
+    pub length, set_length: 27, 16;
+    pub transaction_error, _: 28;
+    pub babble, _: 29;
+    pub buffer_error, _: 30;
+    pub active, set_active: 31;
+}
+
+impl Default for Itd {
+    fn default() -> Self {
+        Self {
+            next: VolatileCell::new(1),
+            transactions: array::from_fn(|_| VolatileCell::new(ItdTransaction(0))),
+            buffers: array::from_fn(|_| VolatileCell::new(0)),
+        }
+    }
+}
+
+/// HCCPARAMS bits 7..4: how far ahead of the controller software has to stay when it
+/// adds isochronous work. Bit 7 set means a whole frame, else the low bits in microframes.
+pub fn isochronous_scheduling_threshold(capability_params: u32) -> u32 {
+    let ist = (capability_params >> 4) & 0xf;
+    if ist & 0x8 != 0 {
+        8
+    } else {
+        ist
+    }
+}
