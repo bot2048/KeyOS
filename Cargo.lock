@@ -697,6 +697,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "audio"
+version = "0.1.0"
+dependencies = [
+ "log 0.4.27",
+ "server",
+ "thiserror 2.0.19",
+ "xous",
+]
+
+[[package]]
+name = "audio-server"
+version = "0.1.0"
+dependencies = [
+ "audio",
+ "log 0.4.27",
+ "server",
+ "uac",
+ "usb",
+ "xous",
+ "xous-api-log",
+]
+
+[[package]]
 name = "auto_enums"
 version = "0.8.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4928,6 +4951,18 @@ dependencies = [
  "log 0.4.27",
  "serde",
  "serde_json",
+ "slint-keyos-platform",
+ "slint-keyos-platform-build",
+ "xous-api-log",
+]
+
+[[package]]
+name = "gui-app-audio-test"
+version = "0.1.0"
+dependencies = [
+ "audio",
+ "log 0.4.27",
+ "server",
  "slint-keyos-platform",
  "slint-keyos-platform-build",
  "xous-api-log",

@@ -90,6 +90,7 @@ const DEFAULT_SERVICES_NORMAL: &[&str] = &[
     "crypto-server",
     "mass-storage-server",
     "mass-storage-emulation",
+    "audio-server",
     "power-manager-server",
     "dma-server",
     "bt-server",
@@ -126,6 +127,7 @@ const DEFAULT_APPS_NORMAL: &[&str] = &[
 ];
 
 const DEV_APPS: &[&str] = &[
+    "gui-app-audio-test",
     "gui-app-crypto-perf",
     "gui-app-entropy-test",
     "gui-app-file-picker-test",
@@ -158,6 +160,7 @@ fn foundation_sideload_artifact_name(crate_name: &str) -> &str {
 // would tear itself down at boot.
 pub const SYSTEM_SERVICES_HOSTED: &[&str] = &[
     "app-manager-server",
+    "audio-server",
     "backup-server",
     "bt-server",
     "camera-server",

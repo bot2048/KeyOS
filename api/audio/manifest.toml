@@ -1,0 +1,6 @@
+manifestVersion = "0"
+[servers."os/audio"]
+Play = { id = 0, type = "lendMut", permissionGroup = "peripherals.feedback", approval = "autoAllow" }
+SetVolume = { id = 1, type = "scalar", permissionGroup = "peripherals.feedback", approval = "autoAllow" }
+Stop = { id = 2, type = "scalar", permissionGroup = "peripherals.feedback", approval = "autoAllow" }
+GetStatus = { id = 3, type = "blockingScalar", permissionGroup = "peripherals.feedback", approval = "autoAllow" }

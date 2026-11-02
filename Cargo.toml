@@ -8,6 +8,7 @@ resolver = "2"
 
 members = [
     "api/app-manager",
+    "api/audio",
     "api/backup",
     "api/bt",
     "api/camera",
@@ -32,6 +33,7 @@ members = [
     "app-archive",
     "apps/app-flux-ethereum",
     "apps/app-flux-solana",
+    "apps/gui-app-audio-test",
     "apps/gui-app-authenticator",
     "apps/gui-app-bitcoin",
     "apps/gui-app-crypto-perf",
@@ -70,6 +72,7 @@ members = [
     "os/ambient-light",
     "os/app-manager",
     "os/app-manifest",
+    "os/audio",
     "os/backup",
     "os/bt",
     "os/camera",
@@ -195,6 +198,7 @@ app-archive = { path = "app-archive" }
 app-flux-build-support = { path = "utils/app-flux-build-support" }
 app-flux-runtime = { path = "utils/app-flux-runtime" }
 app-manager = { path = "api/app-manager" }
+audio = { path = "api/audio" }
 backup = { path = "api/backup" }
 bt = { path = "api/bt" }
 camera = { path = "api/camera" }

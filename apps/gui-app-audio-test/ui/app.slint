@@ -1,0 +1,89 @@
+// SPDX-FileCopyrightText: 2026 Arpan Jain
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+import {
+    BaseWindow,
+    BasePage,
+    ScrollBody,
+    Button,
+    SegmentedControl,
+    HeadingLg,
+    HeadingMd,
+    TextMd,
+} from "@ui/widgets.slint";
+import {
+    Palette,
+    Size,
+    Importance,
+    Images,
+    CurrentTheme,
+    Palettes,
+    Utils,
+} from "@ui/theme.slint";
+
+export global Callbacks {
+    callback play();
+    callback stop();
+    // 0..3 for 25, 50, 75 and 100 %
+    callback volume-changed(int);
+}
+
+export global State {
+    in-out property <bool> playing: false;
+    in-out property <int> volume-index: 1;
+    in property <string> status-text: "Connect USB-C headphones or a USB audio adapter.";
+}
+
+export component AppWindow inherits BaseWindow {
+    BasePage {
+        ScrollBody {
+            VerticalLayout {
+                spacing: Size.sz5;
+
+                HeadingLg {
+                    text: "Audio Test";
+                    horizontal-alignment: center;
+                }
+
+                TextMd {
+                    text: "Plays a 440 Hz tone on a USB audio device on the USB-C port: USB-C headphones, a USB-C to 3.5 mm adapter, or a USB Bluetooth audio transmitter.";
+                    color: Palette.content-secondary;
+                    wrap: word-wrap;
+                }
+
+                HeadingMd {
+                    text: State.status-text;
+                    color: Palette.content-primary;
+                    wrap: word-wrap;
+                }
+
+                TextMd {
+                    text: "Volume";
+                    color: Palette.content-secondary;
+                }
+
+                SegmentedControl {
+                    labels: ["25%", "50%", "75%", "100%"];
+                    selected_index <=> State.volume-index;
+                    changed(_, index) => {
+                        Callbacks.volume-changed(index);
+                    }
+                }
+
+                Button {
+                    label: State.playing ? "Stop" : "Play 440 Hz";
+                    importance: Importance.primary;
+                    clicked => {
+                        if State.playing {
+                            Callbacks.stop();
+                        } else {
+                            Callbacks.play();
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+export { CurrentTheme, Images, Palettes, Utils }

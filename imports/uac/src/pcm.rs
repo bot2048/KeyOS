@@ -77,9 +77,92 @@ pub fn apply_gain(frames: &mut [[i16; 2]], gain: u16) {
     }
 }
 
+/// Converts a stream of stereo frames from one rate to another by linear interpolation:
+/// good enough for tones, speech and notifications, which is what the device plays. Equal
+/// rates pass through untouched.
+#[derive(Debug, Clone)]
+pub struct Resampler {
+    from: u32,
+    to: u32,
+    /// Position between `previous` and `current`, in units of 1/`to` of an input frame.
+    phase: u32,
+    previous: [i16; 2],
+    current: [i16; 2],
+}
+
+impl Resampler {
+    /// A resampler from `from` Hz to `to` Hz.
+    pub fn new(from: u32, to: u32) -> Self {
+        Self { from, to: to.max(1), phase: to.max(1), previous: [0; 2], current: [0; 2] }
+    }
+
+    /// The next output frame, taking input frames from `pull` as they are needed.
+    pub fn next_frame(&mut self, mut pull: impl FnMut() -> [i16; 2]) -> [i16; 2] {
+        if self.from == self.to {
+            return pull();
+        }
+        while self.phase >= self.to {
+            self.previous = self.current;
+            self.current = pull();
+            self.phase -= self.to;
+        }
+        let t = self.phase as i64;
+        let mut out = [0i16; 2];
+        for (channel, sample) in out.iter_mut().enumerate() {
+            let a = self.previous[channel] as i64;
+            let b = self.current[channel] as i64;
+            *sample = (a + (b - a) * t / self.to as i64) as i16;
+        }
+        self.phase += self.from;
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resampling_keeps_the_rate() {
+        let mut r = Resampler::new(48_000, 44_100);
+        let mut pulled = 0usize;
+        for _ in 0..44_100 {
+            r.next_frame(|| {
+                pulled += 1;
+                [0; 2]
+            });
+        }
+        // One second out takes one second in, give or take the frame in hand.
+        assert!((47_999..=48_001).contains(&pulled), "{pulled}");
+
+        let mut r = Resampler::new(48_000, 48_000);
+        let mut n = 0i16;
+        let out: alloc::vec::Vec<_> = (0..4)
+            .map(|_| {
+                r.next_frame(|| {
+                    n += 1;
+                    [n, -n]
+                })
+            })
+            .collect();
+        assert_eq!(out, [[1, -1], [2, -2], [3, -3], [4, -4]]);
+    }
+
+    #[test]
+    fn resampling_interpolates() {
+        // A ramp stays a ramp, one input frame late: output starts from silence.
+        let mut r = Resampler::new(2, 3);
+        let mut n = 0i16;
+        let out: alloc::vec::Vec<i16> = (0..7)
+            .map(|_| {
+                r.next_frame(|| {
+                    n += 300;
+                    [n, n]
+                })[0]
+            })
+            .collect();
+        assert_eq!(out, [0, 200, 400, 600, 800, 1000, 1200]);
+    }
 
     const FRAMES: [[i16; 2]; 2] = [[0x1234, -2], [i16::MIN, i16::MAX]];
 

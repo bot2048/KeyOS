@@ -1,0 +1,9 @@
+manifestVersion = "0"
+appId = "0x383fe87e35e19048926f44b29c568bdd"
+
+[appName]
+en = "Audio Test"
+
+[permissions]
+template = ["gui-app"]
+"os/audio" = ["Play", "SetVolume", "Stop", "GetStatus"]
