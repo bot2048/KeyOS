@@ -34,6 +34,9 @@ const DEFAULT_FONT: &str = "Montserrat";
 const SWIPE_RIGHT_EDGE_AREA_WIDTH_PX: usize = 30; // TODO(SFT-5093): tweak setting
 /// Minimum velocity (in pixels per second) required to consider a swipe right gesture valid.
 const SWIPE_RIGHT_VELOCITY_THRESHOLD: f32 = 300.; // TODO(SFT-5093): tweak setting
+/// How long the finger that started a swipe right gesture rests where it landed before it is taken for the
+/// hand holding the device, once another finger lands.
+const SWIPE_GRIP_MIN_REST: Duration = Duration::from_millis(300);
 /// Minimum swipe distance (in pixels) required to consider a swipe right gesture valid.
 const SWIPE_RIGHT_DISTANCE_THRESHOLD: isize = 100; // TODO(SFT-5093): tweak setting
 
@@ -367,11 +370,17 @@ impl<const WIDTH: usize, const HEIGHT: usize, PG: GuiAppGuiPermissions>
                         // The swipe back gesture follows the first finger only, and owns it while it lasts.
                         // If that finger rests where it landed, it is more likely the hand holding the
                         // device, so give up on the swipe instead of on all other fingers.
-                        let resting = self.primary_touch.is_some_and(|t| t.distance_to(&first_touch) <= 24.);
+                        let (started_at, _, _) = self.swipe_gesture_state.unwrap();
+                        let resting = self.primary_touch.is_some_and(|t| t.distance_to(&first_touch) <= 24.)
+                            && started_at.elapsed() >= SWIPE_GRIP_MIN_REST;
                         if resting && press_consumed {
                             self.swipe_gesture_state = None;
                             self.swipe_abandoned = true;
                         } else if touch.is_press() {
+                            // With another finger down, the first one lifting is no tap anymore
+                            if let Some((_, _, press_consumed)) = &mut self.swipe_gesture_state {
+                                *press_consumed = false;
+                            }
                             // Other touches of fingers are harmless, since the recognizer doesn't know them
                             return;
                         }

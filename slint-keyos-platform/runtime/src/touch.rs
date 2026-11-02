@@ -179,11 +179,12 @@ impl TouchRecognizer {
     pub(crate) fn first_finger_landed(&mut self) { self.wait_for_first_finger = false; }
 
     /// Sends the exit that cancelled the last press again once it is due. Returns when to call again.
+    ///
+    /// An active gesture is not disturbed by it: `ScaleRotateGestureHandler` keeps the grab on an exit.
     pub(crate) fn poll(&mut self, now: Instant, out: &mut impl FnMut(MouseEvent)) -> Option<Instant> {
         let due = self.late_exit?;
-        // A gesture holds the grab, and ends with an exit anyway
-        if now < due || matches!(self.mode, Mode::Multi(Gesture::Active { .. })) {
-            return Some(due.max(now + LATE_EXIT_DELAY / 2));
+        if now < due {
+            return Some(due);
         }
         self.late_exit = None;
         out(MouseEvent::Exit);
@@ -213,9 +214,9 @@ impl TouchRecognizer {
                     grip.grip = true;
                 }
                 self.exit(now, out);
-                self.press(id, position, out);
+                self.press(id, position, now, out);
             }
-            Mode::Idle => self.press(id, position, out),
+            Mode::Idle => self.press(id, position, now, out),
             Mode::Pointer { .. } => {
                 // Cancel the press, so that it doesn't turn into a click
                 self.exit(now, out);
@@ -269,9 +270,13 @@ impl TouchRecognizer {
         }
     }
 
-    fn press(&mut self, id: i32, position: LogicalPoint, out: &mut impl FnMut(MouseEvent)) {
+    fn press(&mut self, id: i32, position: LogicalPoint, now: Instant, out: &mut impl FnMut(MouseEvent)) {
         self.mode = Mode::Pointer { id };
-        self.late_exit = None;
+        // Slint may have delivered a press it held back since the pending exit was sent, which would
+        // otherwise get this finger's release
+        if self.late_exit.take().is_some_and(|due| due < now + LATE_EXIT_DELAY) {
+            out(MouseEvent::Exit);
+        }
         out(MouseEvent::Pressed { position, button: PointerEventButton::Left, click_count: 0, touch_finger_id: id + 1 });
     }
 
@@ -331,9 +336,8 @@ impl TouchRecognizer {
                     _ => 0.0,
                 };
                 *last_scale = scale;
-                if angle.is_some() {
-                    *last_angle = angle;
-                }
+                // Fingers passing through each other turn the angle around, which is no rotation
+                *last_angle = angle;
 
                 let position = midpoint(&self.fingers, ids).unwrap_or_default();
                 out(MouseEvent::PinchGesture { position, delta: scale_delta, phase: TouchPhase::Moved });
@@ -440,8 +444,8 @@ mod tests {
         // Lifting one finger and then the other never releases the pointer
         assert_eq!(h.run(&[(1, 200., 100., Ended)]), []);
         assert_eq!(h.run(&[(0, 120., 100., Moved), (0, 120., 100., Ended)]), [E::Exit]);
-        // Back to normal afterwards
-        assert_eq!(h.run(&[(0, 5., 5., Started)]), [E::Pressed(5., 5.)]);
+        // Back to normal afterwards, after exiting again in case Slint delivered a press it held back
+        assert_eq!(h.run(&[(0, 5., 5., Started)]), [E::Exit, E::Pressed(5., 5.)]);
     }
 
     #[test]
@@ -539,7 +543,7 @@ mod tests {
         // Fingers we don't know anymore are ignored, and so are new fingers until a first one lands
         assert_eq!(h.run(&[(1, 270., 400., Moved), (1, 270., 400., Ended)]), []);
         assert_eq!(h.run(&[(2, 50., 50., Started), (2, 50., 50., Ended)]), []);
-        assert_eq!(h.run(&[(0, 5., 5., Started)]), [E::Pressed(5., 5.)]);
+        assert_eq!(h.run(&[(0, 5., 5., Started)]), [E::Exit, E::Pressed(5., 5.)]);
     }
 
     #[test]
@@ -582,5 +586,82 @@ mod tests {
         let mut h = Harness::new();
         h.run(&[(0, 5., 400., Started)]);
         assert_eq!(h.run(&[(1, 240., 300., Started)]), [E::Exit]);
+    }
+
+    #[test]
+    fn late_exit_comes_during_a_gesture_and_before_a_new_press() {
+        let mut h = Harness::new();
+        h.run(&[(0, 100., 400., Started), (1, 200., 400., Started), (1, 260., 400., Moved)]);
+        h.wait(200);
+        assert_eq!(h.poll(), [E::Exit]);
+
+        h.run(&[(0, 100., 400., Ended), (1, 260., 400., Ended)]);
+        assert_eq!(h.run(&[(0, 5., 5., Started)]), [E::Exit, E::Pressed(5., 5.)]);
+    }
+
+    /// Random touch sequences never click after a second finger or a cancel, and every press ends.
+    #[test]
+    fn invariants_hold_for_random_touches() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut random = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+
+        for _ in 0..2000 {
+            let mut h = Harness::new();
+            // Fingers on the screen, numbered like the gui-server does: 0 for the first one after none,
+            // the lowest free id above 0 for the others
+            let mut down: Vec<i32> = Vec::new();
+            // Whether Slint has a press, and whether a second finger or a cancel happened since all
+            // fingers were last up
+            let mut pressed = false;
+            let mut tainted = false;
+            for _ in 0..30 {
+                // Away from the side edges, where resting fingers are taken for a grip
+                let (x, y) = (16. + random(448) as f32, random(800) as f32);
+                let (id, phase) = match random(10) {
+                    0 => (0, Cancelled),
+                    1..=3 if !down.is_empty() => (down[random(down.len() as u64) as usize], Ended),
+                    4..=7 if !down.is_empty() => (down[random(down.len() as u64) as usize], Moved),
+                    _ if down.len() < 4 => {
+                        let id = if down.is_empty() { 0 } else { (1..).find(|i| !down.contains(i)).unwrap() };
+                        (id, Started)
+                    }
+                    _ => continue,
+                };
+                match phase {
+                    Started => down.push(id),
+                    Ended => down.retain(|&d| d != id),
+                    _ => {}
+                }
+                if down.len() > 1 || phase == Cancelled {
+                    tainted = true;
+                }
+
+                h.wait(random(400));
+                for e in h.run(&[(id, x, y, phase)]).into_iter().chain(h.poll()) {
+                    match e {
+                        E::Pressed(..) => {
+                            assert!(!pressed, "pressed twice");
+                            assert!(!tainted, "pressed after a second finger or a cancel");
+                            pressed = true;
+                        }
+                        E::Released(..) => {
+                            assert!(pressed, "released without a press");
+                            assert!(!tainted, "released after a second finger or a cancel");
+                            pressed = false;
+                        }
+                        E::Exit => pressed = false,
+                        _ => {}
+                    }
+                }
+                if down.is_empty() {
+                    tainted = false;
+                }
+            }
+        }
     }
 }
