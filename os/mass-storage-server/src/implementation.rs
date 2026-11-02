@@ -51,7 +51,7 @@ impl server::ArchiveEventHandler<UsbEvent> for MassStorageServer {
         let Ok(msg) = msg.deserialize() else { return };
 
         match msg {
-            UsbEvent::Connect { handle, descriptors } => {
+            UsbEvent::Connect { handle, descriptors, .. } => {
                 let Some((ep_in, ep_out)) = self.open_endpoints(handle, descriptors) else {
                     return;
                 };

@@ -38,6 +38,7 @@ pub struct PowerManagerServer {
     rstc: Rstc,
     enabled_peripherals: HashSet<PeripheralId>,
     utmi_clock_enabled: bool,
+    uhp_clock_enabled: bool,
 }
 
 impl server::Server for PowerManagerServer {}
@@ -82,7 +83,7 @@ impl PowerManagerServer {
 
         log::debug!("Power manager initialized");
 
-        Ok(Self { pmc, rstc, enabled_peripherals, utmi_clock_enabled: false })
+        Ok(Self { pmc, rstc, enabled_peripherals, utmi_clock_enabled: false, uhp_clock_enabled: false })
     }
 
     fn update_utmi_clock(&mut self) {
@@ -104,6 +105,17 @@ impl PowerManagerServer {
             log::trace!("Disabling UTMI clock");
             self.pmc.disable_utmi_clock();
             self.utmi_clock_enabled = false;
+        }
+        // The host's OHCI half, which runs full-speed devices, needs a 48 MHz clock off
+        // the UTMI PLL besides the peripheral clock.
+        let uhp_wanted = self.enabled_peripherals.contains(&PeripheralId::Uhphs);
+        if uhp_wanted != self.uhp_clock_enabled {
+            if uhp_wanted {
+                self.pmc.enable_uhp_clock();
+            } else {
+                self.pmc.disable_uhp_clock();
+            }
+            self.uhp_clock_enabled = uhp_wanted;
         }
     }
 

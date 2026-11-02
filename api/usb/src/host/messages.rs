@@ -88,6 +88,49 @@ impl From<BulkIn> for server::SimpleMemoryMessage {
     }
 }
 
+/// Bytes in front of the payloads of an isochronous buffer: the header, then the packet
+/// lengths. See [`crate::host::api::IsoBuffer`].
+pub const ISO_DATA_OFFSET: usize = 0x400;
+/// Most packets one isochronous transfer carries.
+pub const MAX_ISO_PACKETS: usize = ehci::MAX_ISO_PACKETS;
+
+/// Header at the start of an isochronous buffer, followed by `packet_count` u16 lengths.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct IsoHeader {
+    pub packet_count: u16,
+    /// wMaxPacketSize of the endpoint, multiplier bits included.
+    pub max_packet_size: u16,
+    /// bInterval of the endpoint.
+    pub interval: u8,
+    pub reserved: [u8; 3],
+}
+
+/// An isochronous OUT transfer: one packet per service interval of the endpoint, the
+/// lengths and endpoint parameters in an [`IsoHeader`] at the start of `buffer`, the
+/// payloads back to back from [`ISO_DATA_OFFSET`]. Answers with the packets sent.
+#[derive(Debug, server::Message)]
+#[response(Result<usize, UsbError>)]
+pub struct IsoOut {
+    pub buffer: MemoryRange,
+    pub handle: usize,
+    pub endpoint: u8,
+    /// Payload bytes from `ISO_DATA_OFFSET`.
+    pub length: usize,
+}
+
+impl From<server::SimpleMemoryMessage> for IsoOut {
+    fn from(msg: server::SimpleMemoryMessage) -> Self {
+        Self { buffer: msg.buf, endpoint: msg.arg1 as u8, length: msg.arg2, handle: msg.arg1 >> 8 }
+    }
+}
+
+impl From<IsoOut> for server::SimpleMemoryMessage {
+    fn from(val: IsoOut) -> Self {
+        Self { buf: val.buffer, arg1: val.endpoint as usize | (val.handle << 8), arg2: val.length }
+    }
+}
+
 /// A control transfer on endpoint zero. The direction is the top bit of
 /// `request_type`, as on the wire.
 #[derive(Debug, server::Message, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -110,8 +153,15 @@ pub struct ResetHostController;
 
 #[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum UsbEvent {
-    Connect { handle: usize, descriptors: descriptors::DescriptorSet },
-    Disconnect { handle: usize },
+    /// `full_speed` devices run on the OHCI controller, with 1 ms service intervals.
+    Connect {
+        handle: usize,
+        descriptors: descriptors::DescriptorSet,
+        full_speed: bool,
+    },
+    Disconnect {
+        handle: usize,
+    },
 }
 
 #[derive(Debug, server::Message)]

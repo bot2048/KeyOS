@@ -1,0 +1,21 @@
+# SPDX-FileCopyrightText: 2026 Arpan Jain
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+[package]
+name = "audio-server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+audio = { workspace = true }
+log = { workspace = true }
+log-server = { workspace = true }
+server = { workspace = true }
+xous = { workspace = true }
+
+[target.'cfg(keyos)'.dependencies]
+uac = { workspace = true }
+usb = { workspace = true }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(keyos)'] }

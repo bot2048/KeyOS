@@ -1,0 +1,15 @@
+manifestVersion = "0"
+appId = "0x6f732f617564696f0000000000000000"
+syscall = ["SetThreadPriority"]
+extends = "../../api/audio"
+
+[appName]
+en = "Audio Server"
+
+[permissions]
+"os/usb" = [
+    "Subscribe",
+    "Claim",
+    "ControlTransfer",
+    "IsoOut",
+]

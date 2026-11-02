@@ -30,6 +30,12 @@ pub enum EhciError {
     TransferError,
     /// The host abandoned the transfer before the controller finished it
     Cancelled,
+    /// Another isochronous stream holds the periodic schedule
+    Busy,
+    /// The packet lengths of an isochronous transfer do not match its buffer or endpoint
+    InvalidTransfer,
+    /// The controller cannot run this kind of transfer, or was not set up for it
+    NotSupported,
 }
 
 pub type Result<T> = core::result::Result<T, EhciError>;

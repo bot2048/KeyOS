@@ -1,0 +1,20 @@
+# SPDX-FileCopyrightText: 2026 Arpan Jain
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+[package]
+name = "gui-app-audio-test"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+audio = { workspace = true }
+log = { workspace = true }
+log-server = { workspace = true }
+server = { workspace = true }
+slint-keyos-platform = { path = "../../slint-keyos-platform/runtime" }
+
+[build-dependencies]
+slint-keyos-platform-build = { path = "../../slint-keyos-platform/build" }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(keyos)'] }

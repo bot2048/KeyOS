@@ -6,7 +6,7 @@ use server::{
     MessageId as _, ScalarHandler,
 };
 use usb::{host::messages::*, UsbError};
-use utralib::{HW_UHPHS_EHCI_BASE, HW_UHPHS_EHCI_MEM};
+use utralib::{HW_UHPHS_EHCI_BASE, HW_UHPHS_EHCI_MEM, HW_UHPHS_OHCI_BASE, HW_UHPHS_OHCI_MEM};
 use xous::{arch::irq::IrqNumber, keyos::PAGE_SIZE, MemoryRange};
 use xous_ticktimer::{Ticktimer, TicktimerCallback};
 
@@ -18,9 +18,11 @@ use crate::PowerManagerApi;
 pub struct UsbHostServer {
     ticktimer: Ticktimer,
     ehci_memory: MemoryRange,
+    ohci_memory: MemoryRange,
     qh_backing: MemoryRange,
     qtd_backing: MemoryRange,
     ehci: ehci::Controller<EhciMessageContext>,
+    ohci: ohci::Controller<EhciMessageContext>,
     event_subscribers: Vec<server::ArchiveEventSubscriber<UsbEvent>>,
     next_device_handle: usize,
     devices: Vec<Device>,
@@ -46,6 +48,15 @@ enum EhciMessageContext {
     BulkIn(DeferredLendMut<BulkIn>),
     BulkOut(DeferredLendMut<BulkOut>),
     Control(ControlContext),
+    IsoOut(DeferredLendMut<IsoOut>),
+}
+
+/// Which controller a device is on: EHCI runs high-speed devices, OHCI the full and
+/// low-speed ones EHCI hands it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Bus {
+    Ehci,
+    Ohci,
 }
 
 /// A control transfer in flight. `data` is where a read lands, and stays empty for a
@@ -67,8 +78,32 @@ impl ehci::TransferContext for EhciMessageContext {
                 &mut body.buffer.as_slice_mut()[..body.length]
             }
             EhciMessageContext::Control(c) => &mut c.data,
+            EhciMessageContext::IsoOut(b) => {
+                let body = b.body_mut();
+                &mut body.buffer.as_slice_mut()[ISO_DATA_OFFSET..ISO_DATA_OFFSET + body.length]
+            }
         }
     }
+
+    fn iso_packet_lengths(&self) -> &[u16] {
+        match self {
+            EhciMessageContext::IsoOut(b) => {
+                let (header, lengths) = iso_header(b.body());
+                &lengths[..header.packet_count as usize]
+            }
+            _ => &[],
+        }
+    }
+}
+
+/// The header and length table of an isochronous buffer, checked against its size by
+/// the IsoOut handler before the buffer gets here.
+fn iso_header(msg: &IsoOut) -> (IsoHeader, &[u16]) {
+    let header = msg.buffer.as_slice::<IsoHeader>()[0];
+    let table = &msg.buffer.as_slice::<u8>()[core::mem::size_of::<IsoHeader>()..ISO_DATA_OFFSET];
+    // The buffer is page aligned and the table starts at an even offset.
+    let lengths = unsafe { core::slice::from_raw_parts(table.as_ptr() as *const u16, table.len() / 2) };
+    (header, lengths)
 }
 
 impl EhciMessageContext {
@@ -81,6 +116,7 @@ impl EhciMessageContext {
                 s.set_response(r)
             }
             EhciMessageContext::BulkOut(mut s) => s.set_response(r),
+            EhciMessageContext::IsoOut(mut s) => s.set_response(r),
             EhciMessageContext::Control(c) => {
                 let ControlContext { response, data, .. } = c;
                 let answer = r.map(|len| data[..len.min(data.len())].to_vec());
@@ -96,6 +132,7 @@ impl EhciMessageContext {
 struct Device {
     handle: usize,
     claimed: Option<xous::PID>,
+    bus: Bus,
     address: u8,
     descriptors: ehci::descriptors::DescriptorSet,
 }
@@ -103,6 +140,7 @@ struct Device {
 struct InterruptContext<'a> {
     conn: server::CheckedConn<InternalPermissions>,
     ehci: &'a ehci::Controller<EhciMessageContext>,
+    ohci: &'a ohci::Controller<EhciMessageContext>,
 }
 
 impl server::Server for UsbHostServer {
@@ -111,6 +149,7 @@ impl server::Server for UsbHostServer {
         let int_ctx = Box::into_raw(Box::new(InterruptContext {
             conn: server::CheckedConn::default(),
             ehci: &self.ehci,
+            ohci: &self.ohci,
         }));
         xous::claim_interrupt(IrqNumber::Uhphs, ehci_irq_handler, int_ctx as *mut usize)
             .expect("Could not claim UHPHS interrupt");
@@ -127,8 +166,14 @@ impl server::Server for UsbHostServer {
 
 impl UsbHostServer {
     const BUFFER_POOL_SIZE: usize = 8;
+    const ED_POOL_SIZE: usize = PAGE_SIZE / core::mem::size_of::<ohci::EdPoolElement>();
+    const ISO_TD_POOL_SIZE: usize = PAGE_SIZE / core::mem::size_of::<ohci::IsoTdPoolElement>();
+    // The pools below each stay within one page, which the drivers rely on for the
+    // physical addresses of their elements.
+    const ITD_POOL_SIZE: usize = PAGE_SIZE / core::mem::size_of::<ehci::ItdPoolElement>();
     const QH_POOL_SIZE: usize = 16;
     const QTD_POOL_SIZE: usize = 128;
+    const TD_POOL_SIZE: usize = PAGE_SIZE / core::mem::size_of::<ohci::TdPoolElement>();
     pub const WORK_PERIOD_MS: usize = 100;
 }
 
@@ -142,6 +187,11 @@ impl UsbHostServer {
         const _: () = assert!(
             HW_UHPHS_EHCI_BASE == HW_UHPHS_EHCI_MEM,
             "EHCI register area must coincide with EHCI custom memory"
+        );
+        #[allow(clippy::assertions_on_constants)]
+        const _: () = assert!(
+            HW_UHPHS_OHCI_BASE == HW_UHPHS_OHCI_MEM,
+            "OHCI register area must coincide with OHCI custom memory"
         );
 
         let power_manager = PowerManagerApi::default();
@@ -188,7 +238,7 @@ impl UsbHostServer {
         )
         .expect("Could not map QTD pool memory");
 
-        let ehci = ehci::Controller::new(
+        let mut ehci = ehci::Controller::new(
             ehci_memory.as_ptr() as usize,
             unsafe { ehci::QueueHeadPool::new(qh_backing.as_slice_mut().as_mut_ptr_range(), virt_to_phys) },
             unsafe { ehci::QtdPool::new(qtd_backing.as_slice_mut().as_mut_ptr_range(), virt_to_phys) },
@@ -196,6 +246,55 @@ impl UsbHostServer {
             virt_to_phys,
         )
         .expect("Could not instantiate EHCI controller");
+        ehci.set_descriptor_buffer(leak(uncached_page(false)));
+        let frame_list = uncached_page(true);
+        let mut itd_backing = uncached_page(true);
+        ehci.set_periodic_schedule(unsafe { &*(frame_list.as_ptr() as *const ehci::FrameList) }, unsafe {
+            ehci::ItdPool::new(
+                itd_backing.as_slice_mut::<ehci::ItdPoolElement>()[..Self::ITD_POOL_SIZE].as_mut_ptr_range(),
+                virt_to_phys,
+            )
+        });
+
+        let ohci_memory = xous::map_memory(
+            xous::MemoryAddress::new(HW_UHPHS_OHCI_BASE),
+            None,
+            PAGE_SIZE,
+            xous::MemoryFlags::W | xous::MemoryFlags::DEV | xous::MemoryFlags::NO_CACHE,
+        )
+        .expect("Could not map OHCI registers");
+        let hcca = uncached_page(true);
+        let mut ed_backing = uncached_page(true);
+        let mut td_backing = uncached_page(true);
+        let mut iso_td_backing = uncached_page(true);
+        let mut ohci_buffer_backing = uncached_page(false);
+        let mut ohci = unsafe {
+            ohci::Controller::new(
+                ohci_memory.as_ptr() as usize,
+                &*(hcca.as_ptr() as *const ohci::Hcca),
+                ohci::EdPool::new(
+                    ed_backing.as_slice_mut::<ohci::EdPoolElement>()[..Self::ED_POOL_SIZE].as_mut_ptr_range(),
+                    virt_to_phys,
+                ),
+                ohci::TdPool::new(
+                    td_backing.as_slice_mut::<ohci::TdPoolElement>()[..Self::TD_POOL_SIZE].as_mut_ptr_range(),
+                    virt_to_phys,
+                ),
+                ohci::IsoTdPool::new(
+                    iso_td_backing.as_slice_mut::<ohci::IsoTdPoolElement>()[..Self::ISO_TD_POOL_SIZE]
+                        .as_mut_ptr_range(),
+                    virt_to_phys,
+                ),
+                ohci::BufferPool::new(
+                    ohci_buffer_backing.as_slice_mut::<ohci::BufferPoolElement>()[..Self::BUFFER_POOL_SIZE]
+                        .as_mut_ptr_range(),
+                    virt_to_phys,
+                ),
+                virt_to_phys,
+            )
+        }
+        .expect("Could not instantiate OHCI controller");
+        ohci.set_descriptor_buffer(leak(uncached_page(false)));
 
         power_manager
             .disable_peripheral(atsama5d27::pmc::PeripheralId::Uhphs)
@@ -203,7 +302,9 @@ impl UsbHostServer {
         Self {
             ticktimer: Ticktimer::default(),
             ehci_memory,
+            ohci_memory,
             ehci,
+            ohci,
             qh_backing,
             qtd_backing,
             event_subscribers: Vec::new(),
@@ -227,15 +328,16 @@ impl UsbHostServer {
             self.statistics.last_print = tick_count;
         };
         self.statistics.work_called += 1;
-        if let Err(e) = self.ehci.work(
-            tick_count as usize,
-            &mut EhciEventHandler {
-                devices: &mut self.devices,
-                next_device_handle: &mut self.next_device_handle,
-                event_subscribers: &mut self.event_subscribers,
-            },
-        ) {
+        let mut handler = EhciEventHandler {
+            devices: &mut self.devices,
+            next_device_handle: &mut self.next_device_handle,
+            event_subscribers: &mut self.event_subscribers,
+        };
+        if let Err(e) = self.ehci.work(tick_count as usize, &mut handler) {
             log::warn!("Error during ehci work(): {e:?}");
+        }
+        if let Err(e) = self.ohci.work(tick_count as usize, &mut handler) {
+            log::warn!("Error during ohci work(): {e:?}");
         }
         self.work_callback.as_ref().unwrap().request(Self::WORK_PERIOD_MS, DoWork::ID, 0);
     }
@@ -246,6 +348,9 @@ impl UsbHostServer {
         }
         self.power_manager.enable_peripheral(atsama5d27::pmc::PeripheralId::Uhphs)?;
         self.enabled = true;
+        // The companion first, so a full-speed device EHCI hands over finds it running.
+        self.ohci.enable()?;
+        self.ohci.enable_interrupts();
         self.ehci.enable()?;
         self.ehci.enable_interrupts();
         self.work();
@@ -257,11 +362,13 @@ impl UsbHostServer {
             return Ok(());
         }
         self.work_callback.as_ref().unwrap().cancel(DoWork::ID);
-        self.ehci.disable(&mut EhciEventHandler {
+        let mut handler = EhciEventHandler {
             devices: &mut self.devices,
             next_device_handle: &mut self.next_device_handle,
             event_subscribers: &mut self.event_subscribers,
-        })?;
+        };
+        self.ehci.disable(&mut handler)?;
+        self.ohci.disable(&mut handler)?;
         self.power_manager.disable_peripheral(atsama5d27::pmc::PeripheralId::Uhphs)?;
         self.enabled = false;
         Ok(())
@@ -281,11 +388,16 @@ impl UsbHostServer {
                 let b = m.body();
                 (m.pid(), b.handle, b.endpoint, b.buffer, b.length)
             }
-            EhciMessageContext::Control(_) => return Err(UsbError::InvalidParameter),
+            EhciMessageContext::Control(_) | EhciMessageContext::IsoOut(_) => {
+                return Err(UsbError::InvalidParameter)
+            }
         };
         let device = self.devices.iter().find(|d| d.handle == handle).ok_or(UsbError::NotFound)?;
         if device.claimed != Some(pid) {
             return Err(UsbError::NotClaimed);
+        }
+        if device.bus == Bus::Ohci {
+            return Err(UsbError::EhciError(ehci::EhciError::NotSupported));
         }
         if length > buffer.len() {
             return Err(UsbError::InvalidParameter);
@@ -330,6 +442,64 @@ impl DeferredLendMutHandler<BulkOut> for UsbHostServer {
     fn default_response() -> <BulkIn as server::LendMut>::Response { Err(UsbError::Other) }
 }
 
+impl UsbHostServer {
+    /// Check an isochronous transfer's device and buffer, and ready the buffer for the
+    /// controller. Returns the device's bus and address, and the endpoint parameters.
+    fn prepare_iso(&mut self, msg: &DeferredLendMut<IsoOut>) -> Result<(Bus, u8, IsoHeader), UsbError> {
+        let body = msg.body();
+        let device = self.devices.iter().find(|d| d.handle == body.handle).ok_or(UsbError::NotFound)?;
+        if device.claimed != Some(msg.pid()) {
+            return Err(UsbError::NotClaimed);
+        }
+        if body.buffer.len() < ISO_DATA_OFFSET || body.length > body.buffer.len() - ISO_DATA_OFFSET {
+            return Err(UsbError::InvalidParameter);
+        }
+        let (header, lengths) = iso_header(body);
+        let count = header.packet_count as usize;
+        if count == 0 || count > MAX_ISO_PACKETS || count > lengths.len() {
+            return Err(UsbError::InvalidParameter);
+        }
+        if let Some(data) = body.buffer.subrange(ISO_DATA_OFFSET, body.length) {
+            xous::flush_cache(data, xous::CacheOperation::Clean).ok();
+        }
+        self.statistics.transfers += 1;
+        Ok((device.bus, device.address, header))
+    }
+}
+
+impl DeferredLendMutHandler<IsoOut> for UsbHostServer {
+    fn handle(&mut self, msg: DeferredLendMut<IsoOut>, _context: &mut server::ServerContext<Self>) {
+        let prepared = self.prepare_iso(&msg);
+        let endpoint = msg.body().endpoint;
+        let context = EhciMessageContext::IsoOut(msg);
+        let (bus, address, header) = match prepared {
+            Ok(p) => p,
+            Err(e) => return context.respond(Err(e)),
+        };
+        let scheduled = match bus {
+            Bus::Ehci => self.ehci.schedule_isochronous_out(
+                address,
+                endpoint,
+                header.max_packet_size,
+                header.interval,
+                context,
+            ),
+            Bus::Ohci => self.ohci.schedule_isochronous_out(
+                address,
+                endpoint,
+                header.max_packet_size,
+                header.interval,
+                context,
+            ),
+        };
+        if let Err((context, err)) = scheduled {
+            context.respond(Err(err.into()));
+        }
+    }
+
+    fn default_response() -> <IsoOut as server::LendMut>::Response { Err(UsbError::Other) }
+}
+
 impl server::BlockingArchiveAsyncHandler<ControlTransfer> for UsbHostServer {
     fn handle(
         &mut self,
@@ -368,10 +538,13 @@ impl server::BlockingArchiveAsyncHandler<ControlTransfer> for UsbHostServer {
 
         self.statistics.transfers += 1;
 
-        let address = device.address;
+        let (bus, address) = (device.bus, device.address);
         let data = if device_to_host { vec![0; length as usize] } else { Vec::new() };
         let context = EhciMessageContext::Control(ControlContext { response, data });
-        let scheduled = self.ehci.schedule_control(address, request, &message.data, context);
+        let scheduled = match bus {
+            Bus::Ehci => self.ehci.schedule_control(address, request, &message.data, context),
+            Bus::Ohci => self.ohci.schedule_control(address, request, &message.data, context),
+        };
         if let Err((ctx, err)) = scheduled {
             ctx.respond(Err(err.into()));
         }
@@ -405,21 +578,11 @@ impl<'a> ehci::EventHandler<EhciMessageContext> for EhciEventHandler<'a> {
         address: u8,
         descriptors: ehci::descriptors::DescriptorSet,
     ) {
-        log::info!("Device connected and configured: {descriptors:?}");
-        let handle = *self.next_device_handle;
-        *self.next_device_handle += 1;
-        self.devices.push(Device { handle, claimed: None, address, descriptors: descriptors.clone() });
-        self.send_event(&UsbEvent::Connect { handle, descriptors });
+        self.connected(Bus::Ehci, address, descriptors);
     }
 
     fn device_disconnected(&mut self, _controller: &mut ehci::Controller<EhciMessageContext>, address: u8) {
-        log::info!("Device disconnected");
-        if let Some(index) = self.devices.iter().position(|d| d.address == address) {
-            self.send_event(&UsbEvent::Disconnect { handle: self.devices[index].handle });
-            self.devices.remove(index);
-        } else {
-            log::debug!("No device entry found for address {address} (may have been rejected)");
-        }
+        self.disconnected(Bus::Ehci, address);
     }
 
     fn transfer_result(
@@ -432,7 +595,49 @@ impl<'a> ehci::EventHandler<EhciMessageContext> for EhciEventHandler<'a> {
     }
 }
 
+impl<'a> ohci::EventHandler<EhciMessageContext> for EhciEventHandler<'a> {
+    fn device_connected(
+        &mut self,
+        _controller: &mut ohci::Controller<EhciMessageContext>,
+        address: u8,
+        descriptors: ehci::descriptors::DescriptorSet,
+    ) {
+        self.connected(Bus::Ohci, address, descriptors);
+    }
+
+    fn device_disconnected(&mut self, _controller: &mut ohci::Controller<EhciMessageContext>, address: u8) {
+        self.disconnected(Bus::Ohci, address);
+    }
+
+    fn transfer_result(
+        &mut self,
+        _controller: &mut ohci::Controller<EhciMessageContext>,
+        result: Result<usize, ehci::EhciError>,
+        context: EhciMessageContext,
+    ) {
+        context.respond(result.map_err(From::from));
+    }
+}
+
 impl<'a> EhciEventHandler<'a> {
+    fn connected(&mut self, bus: Bus, address: u8, descriptors: ehci::descriptors::DescriptorSet) {
+        log::info!("Device connected and configured on {bus:?}: {descriptors:?}");
+        let handle = *self.next_device_handle;
+        *self.next_device_handle += 1;
+        self.devices.push(Device { handle, claimed: None, bus, address, descriptors: descriptors.clone() });
+        self.send_event(&UsbEvent::Connect { handle, descriptors, full_speed: bus == Bus::Ohci });
+    }
+
+    fn disconnected(&mut self, bus: Bus, address: u8) {
+        log::info!("Device disconnected");
+        if let Some(index) = self.devices.iter().position(|d| d.bus == bus && d.address == address) {
+            self.send_event(&UsbEvent::Disconnect { handle: self.devices[index].handle });
+            self.devices.remove(index);
+        } else {
+            log::debug!("No device entry found for address {address} (may have been rejected)");
+        }
+    }
+
     fn send_event(&mut self, event: &UsbEvent) {
         // Send event to each subscriber, keep only those who were actually willing to receive it
         // (e.g. weren't stopped, disconnected, etc.)
@@ -449,7 +654,11 @@ impl ArchiveEventSubscriptionHandler<Subscribe> for UsbHostServer {
     ) -> Result<(), server::Infallible> {
         for device in &self.devices {
             subscriber
-                .send(&UsbEvent::Connect { handle: device.handle, descriptors: device.descriptors.clone() })
+                .send(&UsbEvent::Connect {
+                    handle: device.handle,
+                    descriptors: device.descriptors.clone(),
+                    full_speed: device.bus == Bus::Ohci,
+                })
                 .ok();
         }
         self.event_subscribers.push(subscriber);
@@ -481,7 +690,12 @@ impl BlockingScalarHandler<OpenEndpoint> for UsbHostServer {
         if device.claimed != Some(sender) {
             return Err(UsbError::NotClaimed);
         }
-        self.ehci.open_endpoint(device.address, msg.endpoint, msg.max_packet_length, msg.direction)?;
+        match device.bus {
+            Bus::Ehci => {
+                self.ehci.open_endpoint(device.address, msg.endpoint, msg.max_packet_length, msg.direction)?
+            }
+            Bus::Ohci => self.ohci.open_endpoint(device.address, msg.endpoint, msg.max_packet_length)?,
+        }
         Ok(())
     }
 }
@@ -543,6 +757,7 @@ impl Drop for UsbHostServer {
     fn drop(&mut self) {
         // TODO: halt EHCI
         xous::unmap_memory(self.ehci_memory).ok();
+        xous::unmap_memory(self.ohci_memory).ok();
         xous::unmap_memory(self.qh_backing).ok();
         xous::unmap_memory(self.qtd_backing).ok();
     }
@@ -550,8 +765,25 @@ impl Drop for UsbHostServer {
 
 fn virt_to_phys(p: *const u8) -> usize { xous::virt_to_phys(p as usize).unwrap() }
 
+/// A page of uncached memory for a controller's data structures, which live as long as
+/// the server. `device` makes it strongly ordered, as the descriptor pools are.
+fn uncached_page(device: bool) -> MemoryRange {
+    let mut flags = xous::MemoryFlags::W | xous::MemoryFlags::NO_CACHE | xous::MemoryFlags::POPULATE;
+    if device {
+        flags |= xous::MemoryFlags::DEV;
+    }
+    xous::map_memory(None, None, PAGE_SIZE, flags).expect("Could not map USB host memory")
+}
+
+/// Memory mapped for the life of the server, as a buffer a controller keeps.
+fn leak(range: MemoryRange) -> &'static mut [u8] {
+    unsafe { core::slice::from_raw_parts_mut(range.as_ptr() as *mut u8, range.len()) }
+}
+
 fn ehci_irq_handler(_irq_no: usize, arg: *mut usize) {
     let context = unsafe { &*(arg as *const InterruptContext) };
+    // EHCI and OHCI share the UHPHS interrupt line.
     context.ehci.acknowledge_interrupts();
+    context.ohci.acknowledge_interrupts();
     context.conn.send_scalar_nowait(DoWork).ok();
 }

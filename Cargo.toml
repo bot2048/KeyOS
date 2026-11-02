@@ -8,6 +8,7 @@ resolver = "2"
 
 members = [
     "api/app-manager",
+    "api/audio",
     "api/backup",
     "api/bt",
     "api/camera",
@@ -32,6 +33,7 @@ members = [
     "app-archive",
     "apps/app-flux-ethereum",
     "apps/app-flux-solana",
+    "apps/gui-app-audio-test",
     "apps/gui-app-authenticator",
     "apps/gui-app-bitcoin",
     "apps/gui-app-crypto-perf",
@@ -57,6 +59,8 @@ members = [
     "imports/getrandom",
     "imports/prepare-release/prepare-release-bin",
     "imports/securam-manager",
+    "imports/ohci",
+    "imports/uac",
     "integration-tests/keyos-integration-test",
     "integration-tests/ordered-table-test",
     "integration-tests/settings-test-client",
@@ -68,6 +72,7 @@ members = [
     "os/ambient-light",
     "os/app-manager",
     "os/app-manifest",
+    "os/audio",
     "os/backup",
     "os/bt",
     "os/camera",
@@ -193,6 +198,7 @@ app-archive = { path = "app-archive" }
 app-flux-build-support = { path = "utils/app-flux-build-support" }
 app-flux-runtime = { path = "utils/app-flux-runtime" }
 app-manager = { path = "api/app-manager" }
+audio = { path = "api/audio" }
 backup = { path = "api/backup" }
 bt = { path = "api/bt" }
 camera = { path = "api/camera" }
@@ -250,12 +256,14 @@ ft3269 = { path = "imports/ft3269" }
 fuse = { path = "utils/fuse" }
 libblur = { path = "imports/libblur", default-features = false }
 ltr303 = { path = "imports/ltr303" }
+ohci = { path = "imports/ohci" }
 mass-storage = { path = "imports/mass-storage", features = ["rkyv"] }
 ovm7690-rs = { path = "imports/ovm7690-rs" }
 qbsdiff = { path = "imports/qbsdiff", default-features = false }
 softbuffer = { path = "imports/softbuffer" }
 tar = { path = "imports/tar-rs" }
 tusb320 = { path = "imports/tusb320" }
+uac = { path = "imports/uac" }
 
 # common deps 
 anyhow = "1.0"

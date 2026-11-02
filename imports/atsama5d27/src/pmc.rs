@@ -15,9 +15,13 @@ use utralib::{
         PMC_PCR_EN,
         PMC_PCR_PID,
         PMC_SCDR_LCDCK,
+        PMC_SCDR_UHP,
         PMC_SCER_ISCCK,
         PMC_SCER_LCDCK,
+        PMC_SCER_UHP,
         PMC_SR_LOCKU,
+        PMC_USB_USBDIV,
+        PMC_USB_USBS,
     },
     *,
 };
@@ -336,6 +340,21 @@ impl Pmc {
     pub fn disable_utmi_clock(&mut self) {
         let mut pmc_csr = CSR::new(self.base_addr as *mut u32);
         pmc_csr.wo(CKGR_UCKR, pmc_csr.ms(CKGR_UCKR_UPLLCOUNT, 8))
+    }
+
+    /// Clocks the full-speed (OHCI) side of the USB host from the UTMI PLL: 480 MHz / 10
+    /// gives the 48 MHz it needs. The UTMI clock has to be running.
+    #[inline]
+    pub fn enable_uhp_clock(&mut self) {
+        let mut pmc_csr = CSR::new(self.base_addr as *mut u32);
+        pmc_csr.wo(utralib::utra::pmc::PMC_USB, pmc_csr.ms(PMC_USB_USBS, 1) | pmc_csr.ms(PMC_USB_USBDIV, 9));
+        pmc_csr.wfo(PMC_SCER_UHP, 1);
+    }
+
+    #[inline]
+    pub fn disable_uhp_clock(&mut self) {
+        let mut pmc_csr = CSR::new(self.base_addr as *mut u32);
+        pmc_csr.wfo(PMC_SCDR_UHP, 1);
     }
 
     #[inline]

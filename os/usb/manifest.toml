@@ -1,6 +1,6 @@
 manifestVersion = "0"
 appId = "0x75736200000000000000000000000000"
-memory = ["UDPHS", "UDPHS_RAM", "UHPHS_EHCI"]
+memory = ["UDPHS", "UDPHS_RAM", "UHPHS_EHCI", "UHPHS_OHCI"]
 syscall = ["ClaimInterrupt", "VirtToPhys", "SetThreadPriority"]
 extends = "../../api/usb"
 

@@ -7,13 +7,14 @@ use alloc::vec::Vec;
 use log::{debug, info, warn};
 
 use crate::descriptors::{DescriptorSet, DescriptorType};
+use crate::periodic::{FrameList, PeriodicSchedule};
 use crate::pool::PoolElementHandle;
 use crate::queue::EndpointDirection;
-use crate::registers::{CapabilityRegisters, OperationalRegisters};
+use crate::registers::{isochronous_scheduling_threshold, CapabilityRegisters, OperationalRegisters};
 use crate::transfer::{ControlRequest, Transfer};
 use crate::util::VolatileCellHelper;
 use crate::{error::EhciError, queue::AsyncQueue};
-use crate::{BufferPool, QtdPool, QueueHeadPool, TransferContext};
+use crate::{BufferPool, ItdPool, QtdPool, QueueHeadPool, TransferContext};
 
 /// Largest data stage a control transfer can carry, set by the pool element size.
 pub const MAX_CONTROL_DATA_LEN: usize = 0x40;
@@ -26,6 +27,8 @@ const RESET_HOLD_MS: usize = 300;
 /// EHCI 1.0 PORTSC bit 8: the controller enables the port within 2ms of software
 /// clearing reset.
 const PORT_ENABLE_TIMEOUT_MS: usize = 50;
+/// PORTSC line status of a low-speed device (K state) on an idle port.
+const LINE_STATUS_K_STATE: u32 = 0b01;
 /// USB 2.0 9.2.6.3: SetAddress completes within 50ms, plus 2ms of recovery.
 const SET_ADDRESS_TIMEOUT_MS: usize = 100;
 /// USB 2.0 9.2.6.4: 500ms to the first data packet, then 50ms for the status stage.
@@ -42,13 +45,14 @@ const SET_CONFIGURATION_TIMEOUT_MS: usize = 1000;
 /// that works never finishes.
 pub const fn max_enumeration_ms(work_period_ms: usize) -> usize {
     /// Steps that end on a timer or a register the caller has to come back and read.
-    const POLLED_STEPS: usize = 4;
+    const POLLED_STEPS: usize = 5;
 
     ATTACH_DEBOUNCE_MS
         + RESET_HOLD_MS
         + PORT_ENABLE_TIMEOUT_MS
         + SET_ADDRESS_TIMEOUT_MS
-        + 2 * DATA_STAGE_TIMEOUT_MS
+        // Device descriptor, the head of the configuration, then all of it.
+        + 3 * DATA_STAGE_TIMEOUT_MS
         + SET_CONFIGURATION_TIMEOUT_MS
         + POLLED_STEPS * work_period_ms
 }
@@ -57,11 +61,21 @@ pub const fn max_enumeration_ms(work_period_ms: usize) -> usize {
 pub struct Controller<CT> {
     opregs: *mut OperationalRegisters,
     async_queue: Box<AsyncQueue<BuiltinTransfer<CT>>>,
+    periodic: Option<PeriodicSchedule<CT>>,
     ports: Vec<PortStatus>,
     qtd_pool: QtdPool,
     buffer_pool: BufferPool,
+    descriptor_buffer: Option<DescriptorBuffer>,
+    capability_params: u32,
     virt_to_phys: fn(*const u8) -> usize,
     enabled: bool,
+}
+
+/// Uncached memory a whole configuration descriptor is read into. One port uses it at a
+/// time; the others make do with the head of theirs until it is free.
+struct DescriptorBuffer {
+    buffer: &'static mut [u8],
+    busy: bool,
 }
 
 /// User-defined callbacks for the events that happen during USB processing.
@@ -110,6 +124,13 @@ enum BuiltinTransfer<CT> {
         /// Data stage length; zero leaves the stage out, as CLEAR_FEATURE requires.
         data_len: usize,
     },
+    /// The whole configuration descriptor, read into the descriptor buffer.
+    GetFullConfig {
+        port_number: usize,
+        setup_buffer: PoolElementHandle<[u8; 0x40]>,
+        buffer: *mut u8,
+        len: usize,
+    },
 }
 
 impl<CT> BuiltinTransfer<CT> {
@@ -130,6 +151,11 @@ impl<CT: TransferContext> TransferContext for BuiltinTransfer<CT> {
             BuiltinTransfer::GetDescriptor { data_buffer, .. } => &mut **data_buffer,
             BuiltinTransfer::User { context } => context.data_buffer(),
             BuiltinTransfer::UserControl { data_buffer, data_len, .. } => &mut data_buffer[..*data_len],
+            // The descriptor buffer outlives the transfer, and only this transfer uses it
+            // while it is busy.
+            BuiltinTransfer::GetFullConfig { buffer, len, .. } => unsafe {
+                core::slice::from_raw_parts_mut(*buffer, *len)
+            },
         }
     }
 
@@ -145,6 +171,9 @@ impl<CT: TransferContext> TransferContext for BuiltinTransfer<CT> {
                 &setup_buffer[..core::mem::size_of::<ControlRequest>()]
             }
             BuiltinTransfer::UserControl { setup_buffer, .. } => {
+                &setup_buffer[..core::mem::size_of::<ControlRequest>()]
+            }
+            BuiltinTransfer::GetFullConfig { setup_buffer, .. } => {
                 &setup_buffer[..core::mem::size_of::<ControlRequest>()]
             }
             BuiltinTransfer::User { context } => context.setup_buffer(),
@@ -175,6 +204,11 @@ enum PortStatus {
         descriptor: Vec<u8>,
         since: usize,
     },
+    /// Reading the whole configuration descriptor; `descriptor` is the device descriptor.
+    WaitingForFullConfigDescriptor {
+        descriptor: Vec<u8>,
+        since: usize,
+    },
     WaitingForSetConfiguration {
         descriptor: DescriptorSet,
         since: usize,
@@ -182,6 +216,8 @@ enum PortStatus {
     Configured {
         descriptor: DescriptorSet,
     },
+    /// A full or low-speed device, handed to the companion controller until it leaves.
+    Companion,
 }
 
 impl<CT: TransferContext> Controller<CT> {
@@ -214,17 +250,70 @@ impl<CT: TransferContext> Controller<CT> {
         }
         let opregs = (base + caps_len as usize) as *mut OperationalRegisters;
         let port_number = unsafe { (*caps).structural_params.get().n_ports() } as usize;
+        let capability_params = unsafe { (*caps).capability_params.get() };
         let async_queue = Box::new(AsyncQueue::new(qh_pool)?);
 
         Ok(Self {
             opregs,
             ports: vec![Default::default(); port_number],
             async_queue,
+            periodic: None,
             qtd_pool,
             buffer_pool,
+            descriptor_buffer: None,
+            capability_params,
             virt_to_phys,
             enabled: false,
         })
+    }
+
+    /// Give the controller uncached memory to read whole configuration descriptors into.
+    /// Without it only their first 64 bytes are read, enough for a simple device but not
+    /// for an audio function, whose class descriptors run to hundreds of bytes.
+    pub fn set_descriptor_buffer(&mut self, buffer: &'static mut [u8]) {
+        self.descriptor_buffer = Some(DescriptorBuffer { buffer, busy: false });
+    }
+
+    /// Set the periodic schedule up for isochronous transfers. `frame_list` is 4 KiB
+    /// aligned uncached memory, `itd_pool` holds one element per frame of queued
+    /// isochronous work. Takes effect on the next [`Controller::enable`].
+    pub fn set_periodic_schedule(&mut self, frame_list: &'static FrameList, itd_pool: ItdPool) {
+        let phys = (self.virt_to_phys)(frame_list.as_ptr() as *const u8) as u32;
+        let threshold = isochronous_scheduling_threshold(self.capability_params);
+        self.periodic = Some(PeriodicSchedule::new(frame_list, phys, itd_pool, threshold));
+    }
+
+    /// Schedule an isochronous OUT transfer: one packet per service interval of the
+    /// endpoint, with the lengths [`TransferContext::iso_packet_lengths`] gives and the
+    /// payloads back to back in the data buffer. A transfer starts where the previous
+    /// one on the endpoint ended, or a few frames ahead if the stream ran dry. The result
+    /// is the number of packets sent.
+    ///
+    /// `max_packet_size` and `interval` are the endpoint descriptor's wMaxPacketSize
+    /// (multiplier bits included) and bInterval. Isochronous endpoints need no opening.
+    pub fn schedule_isochronous_out(
+        &mut self,
+        address: u8,
+        endpoint: u8,
+        max_packet_size: u16,
+        interval: u8,
+        context: CT,
+    ) -> Result<(), (CT, EhciError)> {
+        if !self.enabled {
+            return Err((context, EhciError::ControllerDisabled));
+        }
+        let port_number = match self.address_to_port(address) {
+            Ok(n) => n,
+            Err(e) => return Err((context, e)),
+        };
+        if !self.ports[port_number].is_configured() {
+            return Err((context, EhciError::Disconnected));
+        }
+        let Some(periodic) = self.periodic.as_mut() else {
+            return Err((context, EhciError::NotSupported));
+        };
+        let period = 1u32 << (interval.clamp(1, 16) - 1);
+        periodic.schedule_out(address, endpoint, max_packet_size, period, context, self.virt_to_phys)
     }
 
     /// Should be called on every USB interrupt, and periodically at least every 100ms
@@ -232,6 +321,16 @@ impl<CT: TransferContext> Controller<CT> {
     pub fn work(&mut self, tick_count: usize, handler: &mut impl EventHandler<CT>) -> Result<(), EhciError> {
         if !self.enabled {
             return Err(EhciError::ControllerDisabled);
+        }
+        let finished_isochronous = match self.periodic.as_mut() {
+            Some(periodic) => {
+                periodic.advance_clock(unsafe { (*self.opregs).frame_index.get() });
+                periodic.work()
+            }
+            None => Vec::new(),
+        };
+        for (context, result) in finished_isochronous {
+            handler.transfer_result(self, result, context);
         }
         // Harvest completions before scanning the ports, or a device that answers at
         // its deadline gets timed out with the answer already in the queue.
@@ -262,6 +361,11 @@ impl<CT: TransferContext> Controller<CT> {
                 }
                 BuiltinTransfer::SetConfiguration { port_number, .. } => {
                     self.handle_set_configuration_result(port_number, ft.result.is_ok(), handler);
+                }
+                BuiltinTransfer::GetFullConfig { port_number, .. } => {
+                    if let Err(e) = self.handle_full_config_result(port_number, tick_count, ft.result) {
+                        warn!("Error processing the configuration descriptor on {port_number}: {e:?}");
+                    }
                 }
                 BuiltinTransfer::User { context } => {
                     handler.transfer_result(self, ft.result, context);
@@ -440,9 +544,15 @@ impl<CT: TransferContext> Controller<CT> {
 
             // Set up basic registers
             (*self.opregs).async_list.set(self.async_queue.head());
+            if let Some(periodic) = self.periodic.as_mut() {
+                (*self.opregs).periodic_list.set(periodic.frame_list_phys());
+                periodic.reset_clock((*self.opregs).frame_index.get());
+            }
+            let periodic = self.periodic.is_some();
             (*self.opregs).cmd.change(|o| {
                 o.set_run(true);
                 o.set_async_schedule_enable(true);
+                o.set_periodic_schedule_enable(periodic);
             });
             // Take the ports over from the OHCI controller
             (*self.opregs).config.set(1);
@@ -467,6 +577,13 @@ impl<CT: TransferContext> Controller<CT> {
             while !(*self.opregs).status.get().halted() {}
         }
         self.enabled = false;
+        if let Some(buffer) = self.descriptor_buffer.as_mut() {
+            buffer.busy = false;
+        }
+        let cancelled = self.periodic.as_mut().map(|p| p.flush()).unwrap_or_default();
+        for (context, error) in cancelled {
+            handler.transfer_result(self, Err(error), context);
+        }
         for transfer_result in self.async_queue.flush() {
             match transfer_result.context {
                 BuiltinTransfer::User { context } | BuiltinTransfer::UserControl { context, .. } => {
@@ -502,6 +619,9 @@ impl<CT: TransferContext> Controller<CT> {
                     // Make sure all endpoints of this address is closed, as we are
                     // not configured.
                     self.async_queue.close_endpoint(Self::port_to_address(port_number), None, None);
+                    if let Some(periodic) = self.periodic.as_mut() {
+                        periodic.cancel_address(Self::port_to_address(port_number), EhciError::Disconnected);
+                    }
                     if port_status.connected() {
                         *port = PortStatus::Debouncing { since: tick_count };
                     }
@@ -509,6 +629,12 @@ impl<CT: TransferContext> Controller<CT> {
                 PortStatus::Debouncing { since } => {
                     if !port_status.connected() {
                         *port = PortStatus::Disconnected;
+                    } else if port_status.line_status() == LINE_STATUS_K_STATE {
+                        // EHCI 1.0 4.2.2: a low-speed device is the companion's straight away.
+                        info!("Low-speed device on port {port_number}, handing it to the companion");
+                        port_status.set_owner(true);
+                        unsafe { (*self.opregs).ports[port_number].set(port_status) };
+                        *port = PortStatus::Companion;
                     } else if tick_count.wrapping_sub(since) >= ATTACH_DEBOUNCE_MS {
                         info!("Resetting port {port_number}");
                         port_status.set_reset(true);
@@ -517,8 +643,6 @@ impl<CT: TransferContext> Controller<CT> {
                     }
                 }
                 PortStatus::Resetting { since } => {
-                    // XXX: We should check line status, because low speed devices
-                    //      need to be handed over, but we don't support those anyway.
                     if tick_count.wrapping_sub(since) >= RESET_HOLD_MS {
                         debug!("Enabling port {port_number}");
                         port_status.set_reset(false);
@@ -529,6 +653,13 @@ impl<CT: TransferContext> Controller<CT> {
                 PortStatus::WaitingForEnabled { .. } => {
                     if port_status.enabled() {
                         connects.push(port_number);
+                    } else if !port_status.reset() && port_status.connected() {
+                        // EHCI 1.0 4.2.2: reset is over and the port stayed disabled, so the
+                        // device did not chirp. It is a full-speed one, the companion's.
+                        info!("Full-speed device on port {port_number}, handing it to the companion");
+                        port_status.set_owner(true);
+                        unsafe { (*self.opregs).ports[port_number].set(port_status) };
+                        *port = PortStatus::Companion;
                     } else if port.timed_out(tick_count) {
                         debug!("Timed out waiting for port {port_number} to become Enabled");
                         debug!("Status reg: {:?}", unsafe { (*self.opregs).status.get() });
@@ -539,7 +670,8 @@ impl<CT: TransferContext> Controller<CT> {
                 PortStatus::WaitingForSetAddress { .. }
                 | PortStatus::WaitingForSetConfiguration { .. }
                 | PortStatus::WaitingForDeviceDescriptor { .. }
-                | PortStatus::WaitingForConfigDescriptor { .. } => {
+                | PortStatus::WaitingForConfigDescriptor { .. }
+                | PortStatus::WaitingForFullConfigDescriptor { .. } => {
                     if !port_status.connected() {
                         info!("Port {port_number} disconnected while in state {port:?}");
                         *port = PortStatus::Disconnected;
@@ -553,6 +685,13 @@ impl<CT: TransferContext> Controller<CT> {
                         info!("Port {port_number} disconnected");
                         *port = PortStatus::Disconnected;
                         disconnects.push(port_number);
+                    }
+                }
+                PortStatus::Companion => {
+                    // The routing logic gives the port back on disconnect.
+                    if !port_status.owner() {
+                        debug!("Port {port_number} is back from the companion");
+                        *port = PortStatus::Disconnected;
                     }
                 }
             }
@@ -634,22 +773,89 @@ impl<CT: TransferContext> Controller<CT> {
             };
             Ok(())
         } else {
-            debug!("Configuring port {port_number}");
-            let transfer = self.set_configuration_transfer(port_number)?;
-            self.async_queue
-                .schedule_transfer(Self::port_to_address(port_number), transfer)
-                .map_err(|(_, e)| e)?;
-            previous_data.extend_from_slice(&data_buffer[..data_len]);
-            if let Ok(descriptor) = DescriptorSet::new(previous_data) {
-                self.ports[port_number] =
-                    PortStatus::WaitingForSetConfiguration { since: tick_count, descriptor };
-                Ok(())
-            } else {
-                warn!("Invalid descriptor on port {port_number}");
-                self.ports[port_number] = PortStatus::Disconnected;
-                Err(EhciError::DescriptorError)
+            let total_length = u16::from_le_bytes([data_buffer[2], data_buffer[3]]) as usize;
+            if total_length > data_len && data_len >= 4 {
+                if let Some(transfer) = self.full_config_transfer(port_number, total_length)? {
+                    debug!("Reading all {total_length} bytes of the configuration on port {port_number}");
+                    self.async_queue
+                        .schedule_transfer(Self::port_to_address(port_number), transfer)
+                        .map_err(|(_, e)| e)?;
+                    self.ports[port_number] =
+                        PortStatus::WaitingForFullConfigDescriptor { descriptor: previous_data, since: tick_count };
+                    return Ok(());
+                }
+                warn!("Configuration on port {port_number} is {total_length} bytes, keeping the first {data_len}");
             }
+            previous_data.extend_from_slice(&data_buffer[..data_len]);
+            self.configure(port_number, tick_count, previous_data)
         }
+    }
+
+    fn handle_full_config_result(
+        &mut self,
+        port_number: usize,
+        tick_count: usize,
+        result: Result<usize, EhciError>,
+    ) -> Result<(), EhciError> {
+        let Some(buffer) = self.descriptor_buffer.as_mut() else { return Ok(()) };
+        buffer.busy = false;
+        let PortStatus::WaitingForFullConfigDescriptor { descriptor, .. } = &self.ports[port_number] else {
+            debug!("Spurious full configuration descriptor ({port_number})");
+            return Ok(());
+        };
+        let Ok(data_len) = result else {
+            warn!("Reading the configuration failed on port {port_number}");
+            self.ports[port_number] = PortStatus::Disconnected;
+            return Err(EhciError::SetupUnsuccessful);
+        };
+        let mut bytes = descriptor.clone();
+        bytes.extend_from_slice(&buffer.buffer[..data_len.min(buffer.buffer.len())]);
+        self.configure(port_number, tick_count, bytes)
+    }
+
+    fn configure(&mut self, port_number: usize, tick_count: usize, bytes: Vec<u8>) -> Result<(), EhciError> {
+        let Ok(descriptor) = DescriptorSet::new(bytes) else {
+            warn!("Invalid descriptor on port {port_number}");
+            self.ports[port_number] = PortStatus::Disconnected;
+            return Err(EhciError::DescriptorError);
+        };
+        debug!("Configuring port {port_number}");
+        let transfer = self.set_configuration_transfer(port_number)?;
+        self.async_queue.schedule_transfer(Self::port_to_address(port_number), transfer).map_err(|(_, e)| e)?;
+        self.ports[port_number] = PortStatus::WaitingForSetConfiguration { since: tick_count, descriptor };
+        Ok(())
+    }
+
+    /// A read of the whole configuration descriptor into the descriptor buffer, or `None`
+    /// if there is no buffer or another port holds it.
+    fn full_config_transfer(
+        &mut self,
+        port_number: usize,
+        total_length: usize,
+    ) -> Result<Option<Transfer<BuiltinTransfer<CT>>>, EhciError> {
+        let Some(buffer) = self.descriptor_buffer.as_mut() else { return Ok(None) };
+        if buffer.busy {
+            return Ok(None);
+        }
+        let len = total_length.min(buffer.buffer.len());
+        let setup_buffer = self.buffer_pool.alloc(
+            ControlRequest {
+                typ: 0x80,
+                request: 6, /* GET_DESCRIPTOR */
+                value: (DescriptorType::Config as u16) << 8,
+                index: 0,
+                length: len as u16,
+            }
+            .into_tmp_buffer(),
+        )?;
+        let transfer = Transfer::new_control_read(
+            &mut self.qtd_pool,
+            BuiltinTransfer::GetFullConfig { port_number, setup_buffer, buffer: buffer.buffer.as_mut_ptr(), len },
+            self.virt_to_phys,
+        )
+        .map_err(|(_, e)| e)?;
+        buffer.busy = true;
+        Ok(Some(transfer))
     }
 
     fn handle_set_configuration_result(
@@ -807,10 +1013,12 @@ impl PortStatus {
             Self::WaitingForSetConfiguration { since, .. } => (since, SET_CONFIGURATION_TIMEOUT_MS),
             Self::WaitingForDeviceDescriptor { since, .. } => (since, DATA_STAGE_TIMEOUT_MS),
             Self::WaitingForConfigDescriptor { since, .. } => (since, DATA_STAGE_TIMEOUT_MS),
+            Self::WaitingForFullConfigDescriptor { since, .. } => (since, DATA_STAGE_TIMEOUT_MS),
             Self::Disconnected
             | Self::Debouncing { .. }
             | Self::Resetting { .. }
-            | Self::Configured { .. } => return false,
+            | Self::Configured { .. }
+            | Self::Companion => return false,
         };
         tick_count.wrapping_sub(*since) >= timeout
     }

@@ -26,8 +26,11 @@ const HOST_ROLE_PROBE_MS: usize = 2000;
 /// Must outlast a whole enumeration attempt, or we stop sourcing VBUS to a device that
 /// would have come up. The extra 100ms is TSIGATT, what a device is allowed for
 /// signalling attach once VBUS is valid. One attempt is budgeted and not a retry, so a
-/// device that starts over can meet the backoff partway through the second.
-const DEVICE_CONNECTION_TIMEOUT_MS: usize = ehci::max_enumeration_ms(UsbHostServer::WORK_PERIOD_MS) + 100;
+/// device that starts over can meet the backoff partway through the second. A full-speed
+/// device goes through EHCI's reset before it is handed to OHCI and enumerated there.
+const DEVICE_CONNECTION_TIMEOUT_MS: usize = ehci::max_enumeration_ms(UsbHostServer::WORK_PERIOD_MS)
+    + ohci::max_enumeration_ms(UsbHostServer::WORK_PERIOD_MS)
+    + 100;
 
 /// The state's timer ran out. Carries the state it was armed for, because cancelling
 /// does not recall a callback the ticktimer already queued.

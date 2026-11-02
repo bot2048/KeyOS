@@ -11,7 +11,8 @@ use crate::{
     registers::ListElementPointer,
 };
 
-pub(crate) struct PoolElementHandle<T> {
+/// An allocated pool element, given back to the pool when dropped.
+pub struct PoolElementHandle<T> {
     virtual_address: *mut PoolElement<T>,
     physical_address: usize,
 }
@@ -48,7 +49,8 @@ impl<T> Pool<T> {
         }
     }
 
-    pub(crate) fn alloc(&mut self, value: T) -> Result<PoolElementHandle<T>> {
+    /// Move `value` into a free element.
+    pub fn alloc(&mut self, value: T) -> Result<PoolElementHandle<T>> {
         let original_cursor = self.cursor;
         loop {
             self.cursor = self.cursor.wrapping_add(1);
@@ -75,7 +77,10 @@ impl<T> Pool<T> {
 }
 
 impl<T> PoolElementHandle<T> {
-    pub fn to_controller_ptr(&self) -> ListElementPointer<T> {
+    /// Address of the element as a bus master sees it.
+    pub fn physical_address(&self) -> usize { self.physical_address }
+
+    pub(crate) fn to_controller_ptr(&self) -> ListElementPointer<T> {
         ListElementPointer {
             ptr: self.physical_address as u32,
             _phantom_data: PhantomData,
