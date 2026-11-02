@@ -156,6 +156,8 @@ impl<const WIDTH: usize, const HEIGHT: usize, PG: GuiAppGuiPermissions> KeyOsPla
                 touch_recognizer: TouchRecognizer::new(WIDTH as f32),
                 primary_touch: None,
                 swipe_abandoned: false,
+                touch_ids_down: 0,
+                touch_timer: slint::Timer::default(),
                 ticktimer: Ticktimer::default(),
                 framebuffer: None,
             }),
@@ -251,6 +253,10 @@ struct KeyOsEventLoopState<const WIDTH: usize, const HEIGHT: usize, PG: GuiAppGu
     primary_touch: Option<Touch>,
     /// The swipe back gesture gave up on the first finger, which is ignored until lifted.
     swipe_abandoned: bool,
+    /// Bit `n` is set while the finger with id `n` is down.
+    touch_ids_down: u16,
+    /// Wakes the event loop up when the recognizer has something to send later.
+    touch_timer: slint::Timer,
 
     ticktimer: Ticktimer,
     framebuffer: Option<Framebuffer>,
@@ -316,6 +322,14 @@ impl<const WIDTH: usize, const HEIGHT: usize, PG: GuiAppGuiPermissions>
         }
     }
 
+    /// Forgets the fingers that are down, and cancels whatever they pressed.
+    fn cancel_touches(&mut self, events: &mut Vec<PendingEvent>) {
+        self.swipe_gesture_state = None;
+        self.swipe_abandoned = false;
+        self.touch_ids_down = 0;
+        events.push(PendingEvent::TouchCancel);
+    }
+
     /// Converts a touch from the gui-server into a touch of a finger for the [`TouchRecognizer`].
     fn touch_event(&self, touch: &Touch) -> PendingEvent {
         let phase = match touch.kind {
@@ -332,10 +346,21 @@ impl<const WIDTH: usize, const HEIGHT: usize, PG: GuiAppGuiPermissions>
         match event {
             InputMessage::Touch => {
                 if let Some(touch) = Touch::try_from_input_message(&msg.body) {
+                    let bit = 1u16.checked_shl(touch.id as u32).unwrap_or(0);
+                    match touch.kind {
+                        TouchKind::Press => self.touch_ids_down |= bit,
+                        TouchKind::Drag => {}
+                        TouchKind::Release => self.touch_ids_down &= !bit,
+                    }
+
                     if touch.id == 0 {
                         self.primary_touch = Some(touch);
+                        if touch.is_press() {
+                            // A new touch sequence, even if the swipe back gesture takes this finger
+                            self.swipe_abandoned = false;
+                            events.push(PendingEvent::FirstFingerLanded);
+                        }
                         if self.swipe_abandoned {
-                            self.swipe_abandoned = !touch.is_release();
                             return;
                         }
                     } else if let Some((_, first_touch, press_consumed)) = self.swipe_gesture_state {
@@ -343,17 +368,25 @@ impl<const WIDTH: usize, const HEIGHT: usize, PG: GuiAppGuiPermissions>
                         // If that finger rests where it landed, it is more likely the hand holding the
                         // device, so give up on the swipe instead of on all other fingers.
                         let resting = self.primary_touch.is_some_and(|t| t.distance_to(&first_touch) <= 24.);
-                        if !(resting && press_consumed) {
+                        if resting && press_consumed {
+                            self.swipe_gesture_state = None;
+                            self.swipe_abandoned = true;
+                        } else if touch.is_press() {
+                            // Other touches of fingers are harmless, since the recognizer doesn't know them
                             return;
                         }
-                        self.swipe_gesture_state = None;
-                        self.swipe_abandoned = true;
                     }
                     if touch.id == 0 && self.config.enable_swipe_back.get() {
                         let can_go_back = self.router.with(|r| r.has_back());
                         if can_go_back {
                             match self.handle_swipe_right(&touch) {
                                 SwipeResult::Consumed => return,
+                                SwipeResult::TookOver => {
+                                    // The app got the press of this finger: cancel it, which also makes
+                                    // the recognizer forget the finger
+                                    events.push(PendingEvent::TouchCancel);
+                                    return;
+                                }
                                 SwipeResult::Passthrough => {}
                                 SwipeResult::ReplayPress(stored_touch) => {
                                     events.push(self.touch_event(&stored_touch));
@@ -387,15 +420,9 @@ impl<const WIDTH: usize, const HEIGHT: usize, PG: GuiAppGuiPermissions>
                 log::debug!("App is hidden");
                 self.visible = false;
                 // We won't see the fingers that are down now lifted
-                self.swipe_gesture_state = None;
-                self.swipe_abandoned = false;
-                events.push(PendingEvent::TouchCancel);
+                self.cancel_touches(events);
             }
-            InputMessage::TouchCancel => {
-                self.swipe_gesture_state = None;
-                self.swipe_abandoned = false;
-                events.push(PendingEvent::TouchCancel);
-            }
+            InputMessage::TouchCancel => self.cancel_touches(events),
             InputMessage::CloseRequested => Runtime::unsafe_quit(),
 
             // do nothing but allow the event loop to run
@@ -415,6 +442,10 @@ impl<const WIDTH: usize, const HEIGHT: usize, PG: GuiAppGuiPermissions>
     fn dispatch_events(&mut self, events: &mut Vec<PendingEvent>) {
         let window = slint::platform::WindowAdapter::window(&*self.window);
         let window_inner = i_slint_core::window::WindowInner::from_pub(window);
+        let now = Instant::now();
+        let width = slint::platform::WindowAdapter::size(&*self.window).to_logical(window.scale_factor()).width;
+        self.touch_recognizer.set_width(width);
+
         // The recognizer applies the moves of a batch at once: only the last pointer position matters, and
         // slint does a surprisingly large amount of calculations for each of these updates.
         let mut out = |event| {
@@ -430,12 +461,19 @@ impl<const WIDTH: usize, const HEIGHT: usize, PG: GuiAppGuiPermissions>
                     id,
                     i_slint_core::lengths::logical_point_from_api(position),
                     phase,
+                    now,
                     &mut out,
                 ),
-                PendingEvent::TouchCancel => self.touch_recognizer.cancel(&mut out),
+                PendingEvent::TouchCancel => self.touch_recognizer.cancel(now, &mut out),
+                PendingEvent::FirstFingerLanded => self.touch_recognizer.first_finger_landed(),
             }
         }
         self.touch_recognizer.flush(&mut out);
+
+        if let Some(due) = self.touch_recognizer.poll(now, &mut out) {
+            // Only wakes the event loop up, which polls the recognizer again
+            self.touch_timer.start(slint::TimerMode::SingleShot, due - now, || {});
+        }
     }
 
     fn draw(&mut self) {
@@ -491,12 +529,13 @@ impl<const WIDTH: usize, const HEIGHT: usize, PG: GuiAppGuiPermissions>
 
             TouchKind::Drag => {
                 if self.swipe_gesture_state.is_none() {
-                    if touch.x <= SWIPE_RIGHT_EDGE_AREA_WIDTH_PX {
+                    // Not while other fingers are down, which make a gesture of their own
+                    if touch.x <= SWIPE_RIGHT_EDGE_AREA_WIDTH_PX && self.touch_ids_down == 1 {
                         log::debug!("Detected initial swipe right drag at ({}, {})", touch.x, touch.y);
                         // The Press that started this touch was outside the edge zone and already
-                        // forwarded to Slint, so no replay is needed on failure.
+                        // forwarded to Slint, so it is cancelled, and no replay is needed on failure.
                         self.swipe_gesture_state = Some((Instant::now(), touch.clone(), false));
-                        return SwipeResult::Consumed;
+                        return SwipeResult::TookOver;
                     }
                 } else {
                     return SwipeResult::Consumed;
@@ -542,11 +581,15 @@ enum PendingEvent {
     Touch { id: i32, position: LogicalPosition, phase: TouchPhase },
     /// All fingers were taken away from the app.
     TouchCancel,
+    /// The first finger of a new touch sequence landed.
+    FirstFingerLanded,
 }
 
 enum SwipeResult {
     /// The touch was consumed by the swipe handler; do not propagate it.
     Consumed,
+    /// The swipe handler took over a finger whose press was already propagated; cancel it.
+    TookOver,
     /// The touch was not consumed; propagate it normally.
     Passthrough,
     /// The gesture ended without a swipe and the initial Press was consumed. Re-emit the stored

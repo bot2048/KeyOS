@@ -10,6 +10,10 @@
 //! instead (frames were lost in between, or the controller gives its id to a new contact), it is
 //! cancelled, since it was lifted some time ago and maybe somewhere else than where we last saw it.
 //!
+//! A finger that moves further between two frames than any finger does is taken to be another finger
+//! that touched after we missed the first one being lifted (e.g. because we read the controller too late
+//! to see the scans in between), and is cancelled and pressed again.
+//!
 //! After the controller is reset, fingers that are already touching are ignored until all are lifted,
 //! so that touching the screen while it wakes up doesn't press anything.
 //!
@@ -114,6 +118,9 @@ impl TouchEvent {
     }
 }
 
+/// Furthest a finger moves between two frames (in pixels, about 32 mm): further is another finger.
+const MAX_FRAME_JUMP: u32 = 300;
+
 /// Number of different ids `TouchEvent`s use: one more than the number of points, since id 0 is kept for
 /// the first finger.
 pub const NUM_EVENT_IDS: usize = MAX_POINTS + 1;
@@ -135,6 +142,17 @@ struct DownFinger {
     id: u8,
     x: u16,
     y: u16,
+    /// Was reported as an ongoing contact since it was pressed. Some firmware flags a contact as new for
+    /// more than one scan, which must not count as a new finger.
+    seen_contact: bool,
+}
+
+impl DownFinger {
+    fn jumped_to(&self, point: &Point) -> bool {
+        let dx = u32::from(self.x.abs_diff(point.x));
+        let dy = u32::from(self.y.abs_diff(point.y));
+        dx * dx + dy * dy > MAX_FRAME_JUMP * MAX_FRAME_JUMP
+    }
 }
 
 impl FrameTracker {
@@ -152,8 +170,9 @@ impl FrameTracker {
                 let kind = match point {
                     None if !frame_lost => TouchEventKind::Release,
                     None => TouchEventKind::Cancel,
-                    // A new contact under a known id means that we missed the old one being lifted
-                    Some(p) if p.new => TouchEventKind::Cancel,
+                    // A new contact under a known id, or one far away, means that we missed the old one being
+                    // lifted
+                    Some(p) if (p.new && finger.seen_contact) || finger.jumped_to(p) => TouchEventKind::Cancel,
                     Some(_) => continue,
                 };
                 emit(TouchEvent::gone(kind, finger));
@@ -163,6 +182,7 @@ impl FrameTracker {
 
         for (down, point) in self.down.iter_mut().zip(&frame.points) {
             if let (Some(finger), Some(point)) = (down.as_mut(), point) {
+                finger.seen_contact |= !point.new;
                 if (finger.x, finger.y) != (point.x, point.y) {
                     (finger.x, finger.y) = (point.x, point.y);
                     emit(TouchEvent::at(TouchEventKind::Drag, finger.id, point));
@@ -175,7 +195,7 @@ impl FrameTracker {
                 (None, Some(point)) if self.candidates[hw_id] => {
                     self.candidates[hw_id] = false;
                     let id = self.free_id();
-                    self.down[hw_id] = Some(DownFinger { id, x: point.x, y: point.y });
+                    self.down[hw_id] = Some(DownFinger { id, x: point.x, y: point.y, seen_contact: !point.new });
                     emit(TouchEvent::at(TouchEventKind::Press, id, &point));
                 }
                 (None, point) => self.candidates[hw_id] = point.is_some(),
@@ -190,6 +210,9 @@ impl FrameTracker {
     /// A tracker for a controller that was just reset: it forgets all fingers, and ignores the ones that
     /// are touching until they are lifted.
     pub fn after_reset() -> Self { Self { wait_for_lift: true, ..Self::default() } }
+
+    /// Whether any finger is pressed.
+    pub fn has_fingers_down(&self) -> bool { self.down.iter().any(Option::is_some) }
 
     /// Whether any finger is down or about to be pressed.
     pub fn is_touched(&self) -> bool {
@@ -251,7 +274,8 @@ mod tests {
     #[test]
     fn missed_lift_is_cancelled() {
         let mut t = FrameTracker::default();
-        run2(&mut t, Frame::with(&[(0, 10, 20, true)]));
+        run(&mut t, Frame::with(&[(0, 10, 20, true)]));
+        run(&mut t, Frame::with(&[(0, 10, 20, false)]));
         // The lift-up frame was lost, and the next frames are a new finger under the same id
         assert_eq!(
             run2(&mut t, Frame::with(&[(0, 100, 200, true)])),
@@ -345,5 +369,27 @@ mod tests {
         assert_eq!(Frame::parse(&raw(0x0f, &[])), None);
         assert_eq!(Frame::parse(&raw(1, &[[0x80, 0, 0xf0, 0, 0, 0]])), None);
         assert_eq!(Frame::parse(&raw(2, &[[0x80, 0, 0x10, 0, 0, 0], [0x80, 5, 0x10, 5, 0, 0]])), None);
+    }
+
+    #[test]
+    fn jump_is_another_finger() {
+        let mut t = FrameTracker::default();
+        run2(&mut t, Frame::with(&[(0, 10, 400, true)]));
+        // Lift and touch again far away, without us seeing the scans in between
+        assert_eq!(run(&mut t, Frame::with(&[(0, 400, 400, false)])), [(Cancel, 0, 10, 400)]);
+        assert_eq!(run(&mut t, Frame::with(&[(0, 400, 400, false)])), [(Press, 0, 400, 400)]);
+        // A fast but real move is a drag
+        assert_eq!(run(&mut t, Frame::with(&[(0, 200, 400, false)])), [(Drag, 0, 200, 400)]);
+    }
+
+    #[test]
+    fn repeated_press_down_flag_is_the_same_finger() {
+        let mut t = FrameTracker::default();
+        run(&mut t, Frame::with(&[(0, 10, 20, true)]));
+        assert_eq!(run(&mut t, Frame::with(&[(0, 10, 20, true)])), [(Press, 0, 10, 20)]);
+        assert_eq!(run(&mut t, Frame::with(&[(0, 11, 20, true)])), [(Drag, 0, 11, 20)]);
+        assert_eq!(run(&mut t, Frame::with(&[(0, 12, 20, false)])), [(Drag, 0, 12, 20)]);
+        // Flagged new again after it was reported as a contact: another finger
+        assert_eq!(run(&mut t, Frame::with(&[(0, 12, 20, true)])), [(Cancel, 0, 12, 20)]);
     }
 }

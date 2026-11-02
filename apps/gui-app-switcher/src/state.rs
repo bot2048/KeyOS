@@ -99,6 +99,15 @@ impl AppState {
         }
     }
 
+    /// The finger was taken away: put a dragged card back, without closing its app.
+    pub(crate) fn cancel_touch(&mut self, ui: &AppWindow, gui_api: &Arc<GuiApi>) {
+        if self.app_drag_started_at.is_some() {
+            self.reset_app_dragged(ui, gui_api, false);
+        }
+        self.app_first_touch_pos = None;
+        self.last_touch_pos = None;
+    }
+
     pub(crate) fn handle_touch(&mut self, ui: &AppWindow, gui_api: &Arc<GuiApi>, touch: Touch) {
         // The card gestures follow the first finger only
         if touch.id != 0 {

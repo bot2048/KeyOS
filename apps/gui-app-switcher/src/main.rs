@@ -108,6 +108,8 @@ fn app_main(cx: AppContext, ui: AppWindow) {
                 }
             }
 
+            InputMessage::TouchCancel => state.borrow_mut().cancel_touch(&ui, &gui_api),
+
             // App started
             InputMessage::Custom1 => {
                 let msg = &input.envelope.body.memory_message().expect("Custom1 was not a scalar message");

@@ -121,9 +121,9 @@ impl ScalarHandler<RequestRedraw> for Gui {
 
 impl ScalarHandler<EnableMultitouch> for Gui {
     fn handle(&mut self, _msg: EnableMultitouch, sender: PID, _context: &mut ServerContext<Self>) {
-        match self.windows.get_mut(&sender) {
-            Some(window) => window.multitouch = true,
-            None => log::error!("EnableMultitouch from unknown PID={sender}"),
+        // The keyboard and the Control Center send it too, but only ever get the first finger
+        if let Some(window) = self.windows.get_mut(&sender) {
+            window.multitouch = true;
         }
     }
 }

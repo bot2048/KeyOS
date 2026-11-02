@@ -44,9 +44,9 @@ pub(crate) struct TouchState {
     touch_resync: Vec<xous::PID>,
 
     /// Bit `n` is set while the finger with id `n` is down.
-    fingers_down: u16,
-    /// Set when more fingers touched than anyone would use on purpose, until they are all lifted.
-    palm_lockout: bool,
+    pub(crate) fingers_down: u16,
+    /// All fingers are ignored until they are lifted, see [`Gui::touch_ignore_sequence`].
+    ignore_sequence: bool,
 }
 
 impl TouchState {
@@ -66,7 +66,7 @@ impl TouchState {
             primary_target: None,
             touch_resync: Vec::new(),
             fingers_down: 0,
-            palm_lockout: false,
+            ignore_sequence: false,
         }
     }
 }
@@ -95,7 +95,7 @@ impl Gui {
     /// with the device even when the screen has dimmed.
     pub fn touch_dispatch(&mut self, touch: Touch, injected: bool) {
         self.touch_resync();
-        if self.touch_palm_rejected(&touch) {
+        if self.touch_ignore_sequence(&touch, injected) {
             return;
         }
 
@@ -107,6 +107,10 @@ impl Gui {
         }
 
         if self.is_control_center_animating() {
+            // An app that got the press of this finger must not wait for its release forever
+            if touch.kind != TouchKind::Press && self.touch_state.origin == TouchGestureOrigin::App {
+                self.touch_cancel_all();
+            }
             return;
         }
 
@@ -155,14 +159,6 @@ impl Gui {
             } else {
                 TouchGestureOrigin::App
             };
-        }
-
-        // If reset_auto_lock returns true, it means we were dimmed. In this case swallow the gesture, because
-        // 'undim' was the action. If the user actually wants to click something, they will press again.
-        // For injected (debug bridge) touches, still reset the auto-lock but don't swallow.
-        if self.reset_auto_lock() && !injected {
-            self.touch_state.origin = TouchGestureOrigin::None;
-            return;
         }
 
         if !self.is_control_center_collapsed()
@@ -291,8 +287,7 @@ impl Gui {
     pub(crate) fn touch_cancel_finger(&mut self, id: usize) {
         let state = &mut self.touch_state;
         state.fingers_down &= !1u16.checked_shl(id as u32).unwrap_or(0);
-        if state.palm_lockout {
-            state.palm_lockout = state.fingers_down != 0;
+        if state.ignore_sequence {
             return;
         }
 
@@ -344,31 +339,52 @@ impl Gui {
         });
     }
 
-    /// More fingers at once than anyone would use on purpose on this screen are a palm or a hand
-    /// gripping the device. Takes every touch away from the apps when that happens, and ignores the panel
-    /// until all fingers are lifted. Returns whether to ignore `touch`.
-    fn touch_palm_rejected(&mut self, touch: &Touch) -> bool {
+    /// Decides whether to ignore the touch sequence (from the first finger landing to the last one being
+    /// lifted) that `touch` belongs to, and returns whether to ignore `touch`. Fingers of an ignored
+    /// sequence that apps already got are cancelled for them.
+    ///
+    /// A sequence is ignored when it woke the screen up from being dimmed, since the user couldn't see
+    /// what they touched, and when more fingers touch at once than anyone would use on purpose on this
+    /// screen, since that is a palm or a hand gripping the device.
+    fn touch_ignore_sequence(&mut self, touch: &Touch, injected: bool) -> bool {
         let state = &mut self.touch_state;
+        let starts_sequence = touch.kind == TouchKind::Press && state.fingers_down == 0;
         let bit = 1u16.checked_shl(touch.id as u32).unwrap_or(0);
         match touch.kind {
             TouchKind::Press => state.fingers_down |= bit,
             TouchKind::Drag => {}
             TouchKind::Release => state.fingers_down &= !bit,
         }
+        if starts_sequence {
+            state.ignore_sequence = false;
+        }
 
-        if !state.palm_lockout && state.fingers_down.count_ones() > MAX_INTENTIONAL_TOUCHES {
+        // Injected (debug bridge) touches still undim, but are never ignored for it
+        if self.reset_auto_lock() && !injected && !self.touch_state.ignore_sequence {
+            if !starts_sequence {
+                // The screen dimmed while fingers were resting on it
+                self.touch_cancel_all();
+            }
+            self.touch_state.ignore_sequence = true;
+        }
+
+        if !self.touch_state.ignore_sequence && self.touch_state.fingers_down.count_ones() > MAX_INTENTIONAL_TOUCHES {
             log::info!("Too many fingers on the touch panel, ignoring it until they are lifted");
-            state.palm_lockout = true;
             self.touch_cancel_all();
+            self.touch_state.ignore_sequence = true;
         }
 
-        let state = &mut self.touch_state;
-        if state.palm_lockout && state.fingers_down == 0 {
-            state.palm_lockout = false;
-            // This was the release of the last finger
-            return true;
+        self.touch_state.ignore_sequence
+    }
+
+    /// Keeps the screen awake while fingers rest on it without moving.
+    #[cfg_attr(not(keyos), allow(dead_code))]
+    pub(crate) fn touch_keep_awake(&mut self) {
+        if self.reset_auto_lock() && !self.touch_state.ignore_sequence {
+            // The screen dimmed anyway, so the user may not have seen what the fingers touch
+            self.touch_cancel_all();
+            self.touch_state.ignore_sequence = true;
         }
-        state.palm_lockout
     }
 
     /// Forwards a touch of a finger other than the first one, so that apps can
@@ -388,19 +404,29 @@ impl Gui {
         let target = match touch.kind {
             TouchKind::Press => {
                 self.touch_state.secondary_touches[touch.id].0 = None;
-                if is_locked || self.touch_state.origin != TouchGestureOrigin::App {
+                // Only into the app that the first finger is in, and is still active
+                let Some(pid) = self.touch_state.primary_target.filter(|&pid| self.active_app_pid() == Some(pid))
+                else {
+                    return;
+                };
+                if is_locked {
                     return;
                 }
                 // A further finger that lands on the side edges is likely the hand holding the device,
-                // and one below the screen is on the virtual button rather than in the app.
+                // one below the screen is on the virtual button, and ones on the keyboard or the
+                // Control Center are not in the app either.
+                let keyboard_height = self
+                    .with_active_app(|w| w.keyboard_state.height().unwrap_or(0))
+                    .unwrap_or(0)
+                    .saturating_sub(KEYBOARD_TOP_BAR_MARGIN);
                 if touch.x < SECONDARY_TOUCH_EDGE_MARGIN
                     || touch.x >= SCREEN_WIDTH - SECONDARY_TOUCH_EDGE_MARGIN
-                    || touch.y >= SCREEN_HEIGHT
+                    || touch.y >= SCREEN_HEIGHT - keyboard_height
+                    || self.is_touch_within_control_center(touch)
                 {
                     return;
                 }
                 // Apps that don't handle several fingers would take them for the first one
-                let Some(pid) = self.active_app_pid() else { return };
                 if !self.windows.get(&pid).is_some_and(|w| w.multitouch) {
                     return;
                 }
@@ -432,11 +458,28 @@ impl Gui {
         // The fingers that are down now won't be reported as lifted
         self.touch_cancel_all();
         self.touch_state.fingers_down = 0;
-        self.touch_state.palm_lockout = false;
+        self.touch_state.ignore_sequence = false;
     }
 
-    /// Tells every app that fingers are touching that they were taken away, and forgets them.
-    fn touch_cancel_all(&mut self) {
+    /// Tells every app that fingers are touching that they were taken away, and forgets them. A system
+    /// gesture in progress ends as if the finger was lifted.
+    pub(crate) fn touch_cancel_all(&mut self) {
+        match self.touch_state.origin {
+            TouchGestureOrigin::ControlCenter => {
+                if let Some(w) = &self.control_center_window {
+                    if matches!(w.state, ControlCenterWindowState::Dragged) {
+                        self.control_center_expand();
+                    }
+                }
+            }
+            _ => {}
+        }
+        // The swipe up from the virtual button that opens the switcher
+        if self.touch_state.switcher_gesture_state.started {
+            self.touch_state.switcher_gesture_state.reset();
+            self.abort_switching_animation();
+        }
+
         let mut apps: Vec<xous::PID> =
             self.touch_state.secondary_touches.iter().filter_map(|&(target, _, _)| target).collect();
         apps.extend(self.touch_state.primary_target.take());
