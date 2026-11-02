@@ -13,12 +13,12 @@ use gui_server_api::{
     touch::{Touch, TouchKind},
     GuiApi, InputMessage, Key, NextFrameAnimationKind,
 };
-use i_slint_core::{partial_renderer::DirtyRegion, renderer::RendererSealed};
+use i_slint_core::{input::TouchPhase, partial_renderer::DirtyRegion, renderer::RendererSealed};
 use server::FromScalar;
 #[cfg(not(feature = "recovery-os"))]
 use slint::{platform::WindowAdapter, private_unstable_api::re_exports::WindowInner};
 use slint::{
-    platform::{software_renderer::LineBufferProvider, EventLoopProxy, PointerEventButton, WindowEvent},
+    platform::{software_renderer::LineBufferProvider, EventLoopProxy, WindowEvent},
     LogicalPosition, PhysicalPosition, PhysicalSize, PlatformError, SharedString,
 };
 use xous::{envelope::Envelope, DropDeallocate, MemoryRange};
@@ -146,6 +146,7 @@ impl<const WIDTH: usize, const HEIGHT: usize, PG: GuiAppGuiPermissions> KeyOsPla
                 config: cx.config.clone(),
 
                 swipe_gesture_state: None,
+                active_touches: 0,
                 ticktimer: Ticktimer::default(),
                 framebuffer: None,
             }),
@@ -236,6 +237,9 @@ struct KeyOsEventLoopState<const WIDTH: usize, const HEIGHT: usize, PG: GuiAppGu
     // The bool is true when the initial Press was consumed (needs to be replayed on swipe failure).
     swipe_gesture_state: Option<(Instant, Touch, bool)>,
 
+    // Bit `n` is set while the finger with id `n` is down, as far as Slint knows.
+    active_touches: u16,
+
     ticktimer: Ticktimer,
     framebuffer: Option<Framebuffer>,
 }
@@ -300,43 +304,50 @@ impl<const WIDTH: usize, const HEIGHT: usize, PG: GuiAppGuiPermissions>
         }
     }
 
-    fn process_input(&mut self, event: InputMessage, msg: Envelope, events: &mut Vec<WindowEvent>) {
+    /// Converts a touch from the gui-server into a touch point for Slint, which turns a single finger into
+    /// pointer events and two fingers into pinch and rotation gestures.
+    fn touch_event(&mut self, touch: &Touch) -> PendingEvent {
+        let bit = 1u16.checked_shl(touch.id as u32).unwrap_or(0);
+        let phase = match touch.kind {
+            TouchKind::Press => {
+                self.active_touches |= bit;
+                TouchPhase::Started
+            }
+            TouchKind::Drag => TouchPhase::Moved,
+            TouchKind::Release => {
+                self.active_touches &= !bit;
+                TouchPhase::Ended
+            }
+        };
+        let position =
+            PhysicalPosition::new(touch.x as i32, touch.y as i32).to_logical(self.window.scale_factor());
+        PendingEvent::Touch { id: touch.id as i32, position, phase }
+    }
+
+    fn process_input(&mut self, event: InputMessage, msg: Envelope, events: &mut Vec<PendingEvent>) {
         match event {
             InputMessage::Touch => {
                 if let Some(touch) = Touch::try_from_input_message(&msg.body) {
-                    let button = PointerEventButton::Left;
-
-                    if self.config.enable_swipe_back.get() {
+                    // The swipe back gesture follows the first finger only
+                    if touch.id == 0 && self.config.enable_swipe_back.get() {
                         let can_go_back = self.router.with(|r| r.has_back());
                         if can_go_back {
                             match self.handle_swipe_right(&touch) {
                                 SwipeResult::Consumed => return,
                                 SwipeResult::Passthrough => {}
                                 SwipeResult::ReplayPress(stored_touch) => {
-                                    let position =
-                                        PhysicalPosition::new(stored_touch.x as i32, stored_touch.y as i32)
-                                            .to_logical(self.window.scale_factor());
-                                    events.push(WindowEvent::PointerPressed { position, button });
+                                    events.push(self.touch_event(&stored_touch));
                                 }
                             }
                         }
                     }
 
-                    let position = PhysicalPosition::new(touch.x as i32, touch.y as i32)
-                        .to_logical(self.window.scale_factor());
-                    events.push(match touch.kind {
-                        TouchKind::Press => WindowEvent::PointerPressed { position, button },
-                        TouchKind::Drag => WindowEvent::PointerMoved { position },
-                        TouchKind::Release => WindowEvent::PointerReleased { position, button },
-                    });
-                    if matches!(touch.kind, TouchKind::Release) {
-                        events.push(WindowEvent::PointerExited);
-                    }
+                    events.push(self.touch_event(&touch));
                 }
             }
 
-            InputMessage::KeyPress => events.push(self.handle_key_event_msg(true, &msg)),
-            InputMessage::KeyRelease => events.push(self.handle_key_event_msg(false, &msg)),
+            InputMessage::KeyPress => events.push(PendingEvent::Window(self.handle_key_event_msg(true, &msg))),
+            InputMessage::KeyRelease => events.push(PendingEvent::Window(self.handle_key_event_msg(false, &msg))),
             InputMessage::Scroll => {
                 let scalar = msg.body.scalar_message().expect("scalar message");
                 // x/y are already in logical (device-space) pixels — use them directly.
@@ -346,7 +357,7 @@ impl<const WIDTH: usize, const HEIGHT: usize, PG: GuiAppGuiPermissions>
                 let delta_x = f32::from_bits(scalar.arg3 as u32);
                 let delta_y = f32::from_bits(scalar.arg4 as u32);
                 let position = LogicalPosition::new(x as f32, y as f32);
-                events.push(WindowEvent::PointerScrolled { position, delta_x, delta_y });
+                events.push(PendingEvent::Window(WindowEvent::PointerScrolled { position, delta_x, delta_y }));
             }
             InputMessage::Visible => {
                 log::debug!("App is now visible");
@@ -355,6 +366,21 @@ impl<const WIDTH: usize, const HEIGHT: usize, PG: GuiAppGuiPermissions>
             InputMessage::Hidden => {
                 log::debug!("App is hidden");
                 self.visible = false;
+                // We won't see the fingers that are down now lifted. Exit first so that cancelling them
+                // doesn't click anything.
+                if self.active_touches != 0 {
+                    events.push(PendingEvent::Window(WindowEvent::PointerExited));
+                }
+                for id in 0..u16::BITS as usize {
+                    if self.active_touches & (1 << id) != 0 {
+                        events.push(PendingEvent::Touch {
+                            id: id as i32,
+                            position: LogicalPosition::default(),
+                            phase: TouchPhase::Cancelled,
+                        });
+                    }
+                }
+                self.active_touches = 0;
             }
             InputMessage::CloseRequested => Runtime::unsafe_quit(),
 
@@ -372,19 +398,31 @@ impl<const WIDTH: usize, const HEIGHT: usize, PG: GuiAppGuiPermissions>
         }
     }
 
-    fn dispatch_events(&self, events: &mut Vec<WindowEvent>) {
+    fn dispatch_events(&self, events: &mut Vec<PendingEvent>) {
         let mut event_it = events.drain(..).peekable();
         while let Some(event) = event_it.next() {
-            // Only apply the last PointerMoved event if there are multiple consecutive ones. All
-            // other ones would just be wasted calculation, as just the move is
-            // rarely actionable, but slint does a surprisingly large amount of
-            // calculations for each of these updates.
-            if matches!(event, WindowEvent::PointerMoved { .. })
-                && event_it.peek().map_or(false, |ne| matches!(ne, WindowEvent::PointerMoved { .. }))
-            {
-                continue;
+            match event {
+                PendingEvent::Window(event) => self.window.dispatch_event(event),
+                PendingEvent::Touch { id, position, phase } => {
+                    // Only apply the last move of a finger if there are multiple consecutive ones. All
+                    // other ones would just be wasted calculation, as just the move is
+                    // rarely actionable, but slint does a surprisingly large amount of
+                    // calculations for each of these updates.
+                    if phase == TouchPhase::Moved
+                        && event_it.peek().is_some_and(|next| {
+                            matches!(next, PendingEvent::Touch { id: next_id, phase: TouchPhase::Moved, .. } if *next_id == id)
+                        })
+                    {
+                        continue;
+                    }
+                    let window = slint::platform::WindowAdapter::window(&*self.window);
+                    i_slint_core::window::WindowInner::from_pub(window).process_touch_input(
+                        id,
+                        i_slint_core::lengths::logical_point_from_api(position),
+                        phase,
+                    );
+                }
             }
-            self.window.dispatch_event(event);
         }
     }
 
@@ -484,6 +522,12 @@ impl<const WIDTH: usize, const HEIGHT: usize, PG: GuiAppGuiPermissions>
             }
         }
     }
+}
+
+/// An input event waiting to be dispatched to Slint.
+enum PendingEvent {
+    Window(WindowEvent),
+    Touch { id: i32, position: LogicalPosition, phase: TouchPhase },
 }
 
 enum SwipeResult {

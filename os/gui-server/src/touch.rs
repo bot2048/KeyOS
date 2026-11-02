@@ -26,6 +26,9 @@ pub(crate) struct TouchState {
     pub(crate) hw_state: crate::touch::atsama5d2::HwTouchState,
     last_x: usize,
     last_y: usize,
+
+    /// The app that the finger with id `n` (n > 0) is being forwarded to, and its last position.
+    secondary_touches: [(Option<xous::PID>, usize, usize); 16],
 }
 
 impl TouchState {
@@ -41,6 +44,7 @@ impl TouchState {
             switcher_gesture_state: SwitcherGestureState::default(),
             last_x: 0,
             last_y: 0,
+            secondary_touches: [(None, 0, 0); 16],
         }
     }
 }
@@ -68,6 +72,13 @@ impl Gui {
     /// but the touch is **not** swallowed — so a single tap is enough to interact
     /// with the device even when the screen has dimmed.
     pub fn touch_dispatch(&mut self, touch: Touch, injected: bool) {
+        // Only the first finger drives system gestures, since the code below assumes a certain
+        // Press->drag->release order. Further fingers go to the app that the first finger is in.
+        if touch.id > 0 {
+            self.secondary_touch_dispatch(touch, injected);
+            return;
+        }
+
         if self.is_control_center_animating() {
             return;
         }
@@ -78,12 +89,6 @@ impl Gui {
             VIRT_BUTTON_PHYS_WIDTH,
             VIRT_BUTTON_PHYS_HEIGHT,
         );
-
-        // Don't process more than one simultaneous touch, since the code below assumes a certain
-        // Press->drag->release order
-        if touch.id > 0 {
-            return;
-        }
 
         #[cfg(feature = "recovery-os")]
         let is_locked = true;
@@ -248,6 +253,46 @@ impl Gui {
         }
     }
 
+    /// Forwards a touch of a finger other than the first one to the active app, so that apps can
+    /// recognize multi-finger gestures. A finger is forwarded only if it lands while the first
+    /// finger is in an unlocked app, and then to that same app until it is lifted, so that the app
+    /// always sees the finger lifted again.
+    fn secondary_touch_dispatch(&mut self, touch: Touch, injected: bool) {
+        let Some(&(target, last_x, last_y)) = self.touch_state.secondary_touches.get(touch.id) else {
+            return;
+        };
+
+        #[cfg(feature = "recovery-os")]
+        let is_locked = true;
+        #[cfg(not(feature = "recovery-os"))]
+        let is_locked = self.is_locked();
+
+        let target = match touch.kind {
+            TouchKind::Press => {
+                self.touch_state.secondary_touches[touch.id].0 = None;
+                if is_locked || self.touch_state.origin != TouchGestureOrigin::App {
+                    return;
+                }
+                let Some(pid) = self.active_app_pid() else { return };
+                pid
+            }
+            // Same filtering of redundant drag events as for the first finger
+            TouchKind::Drag if (last_x, last_y) == (touch.x, touch.y) => return,
+            TouchKind::Drag | TouchKind::Release => {
+                let Some(pid) = target else { return };
+                pid
+            }
+        };
+        self.touch_state.secondary_touches[touch.id] =
+            (if touch.kind == TouchKind::Release { None } else { Some(target) }, touch.x, touch.y);
+
+        let offset = if injected { 0 } else { self.touch_state.offset };
+        let touch = touch.with_offset(0, offset);
+        if let Some(window) = self.windows.get(&target) {
+            xous::try_send_message(window.input_cid, touch.as_input_message(InputMessage::Touch as usize)).ok();
+        }
+    }
+
     pub(crate) fn touch_on(&mut self) {
         #[cfg(keyos)]
         self.touch_state.hw_state.enable();
@@ -256,5 +301,13 @@ impl Gui {
     pub(crate) fn touch_off(&mut self) {
         #[cfg(keyos)]
         self.touch_state.hw_state.disable();
+
+        // The controller won't report the fingers that are down now as released, so do it here
+        for id in 1..self.touch_state.secondary_touches.len() {
+            let (target, x, y) = self.touch_state.secondary_touches[id];
+            if target.is_some() {
+                self.secondary_touch_dispatch(Touch { kind: TouchKind::Release, id, x, y }, false);
+            }
+        }
     }
 }

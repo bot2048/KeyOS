@@ -16,7 +16,7 @@ use {
         PlatformDisplay,
     },
     gui_server_api::{
-        consts::{DEVICE_HEIGHT, DEVICE_WIDTH},
+        consts::{DEVICE_HEIGHT, DEVICE_WIDTH, SCREEN_HEIGHT, SCREEN_WIDTH},
         touch::{Touch, TouchKind},
     },
     image::ImageBuffer,
@@ -33,7 +33,7 @@ use {
         dpi::{LogicalPosition, PhysicalPosition, PhysicalSize},
         event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent},
         event_loop::EventLoop,
-        keyboard::{Key as WinitKey, NamedKey},
+        keyboard::{Key as WinitKey, ModifiersState, NamedKey},
         window::{Window, WindowButtons, WindowLevel},
     },
 };
@@ -56,6 +56,10 @@ struct EmulatorApp {
     last_cursor_pos: LogicalPosition<f64>,
     last_window_pos: Option<PhysicalPosition<i32>>,
     last_pressed: bool,
+    modifiers: ModifiersState,
+    /// Position of the emulated second finger, which mirrors the mouse around the center of the screen
+    /// while a touch started with Ctrl held is going on. Lets us try pinch and rotate gestures.
+    mirror_touch: Option<(usize, usize)>,
     resizer: fast_image_resize::Resizer,
     surface: Option<softbuffer::Surface>,
     raised: bool,
@@ -86,6 +90,17 @@ impl EmulatorApp {
         if let Err(err) = result {
             log::warn!("Failed to {action}: {err:?}");
         }
+    }
+
+    /// Sends a touch of the emulated second finger, mirroring the given touch screen position.
+    fn send_mirror_touch(&mut self, kind: TouchKind, x: usize, y: usize) {
+        let x = SCREEN_WIDTH.saturating_sub(1).saturating_sub(x);
+        let y = SCREEN_HEIGHT.saturating_sub(1).saturating_sub(y);
+        self.mirror_touch = if kind == TouchKind::Release { None } else { Some((x, y)) };
+        let touch = Touch { kind, id: 1, x, y };
+        self.send_capture_event("send hosted simulator mirror touch", |capture_api| {
+            capture_api.inject_touch(touch)
+        });
     }
 
     fn update_scale_factor(&mut self) {
@@ -293,6 +308,10 @@ impl ApplicationHandler for EmulatorApp {
                     self.send_capture_event("send hosted simulator drag touch", |capture_api| {
                         capture_api.inject_touch(touch)
                     });
+
+                    if self.mirror_touch.is_some() && is_in_touch_screen {
+                        self.send_mirror_touch(TouchKind::Drag, x as usize, y as usize);
+                    }
                 }
             }
 
@@ -363,6 +382,17 @@ impl ApplicationHandler for EmulatorApp {
                     self.send_capture_event("send hosted simulator touch", |capture_api| {
                         capture_api.inject_touch(touch)
                     });
+
+                    if self.last_pressed && is_within_touch_area && self.modifiers.control_key() {
+                        self.send_mirror_touch(TouchKind::Press, x as usize, y as usize);
+                    }
+                }
+
+                // Always lift the emulated finger, even if the mouse was released outside the screen
+                if !self.last_pressed {
+                    if let Some((x, y)) = self.mirror_touch {
+                        self.send_mirror_touch(TouchKind::Release, SCREEN_WIDTH - 1 - x, SCREEN_HEIGHT - 1 - y);
+                    }
                 }
             }
 
@@ -422,6 +452,8 @@ impl ApplicationHandler for EmulatorApp {
                 }
             }
 
+            WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
+
             WindowEvent::Focused(true) => {
                 // Focus arrived: record it and drop the pin (a no-op if unpinned).
                 self.focus_seen.store(true, Ordering::Relaxed);
@@ -457,6 +489,8 @@ pub(crate) fn run_window() {
         last_cursor_pos: Default::default(),
         last_window_pos: Default::default(),
         last_pressed: false,
+        modifiers: ModifiersState::default(),
+        mirror_touch: None,
         resizer: fast_image_resize::Resizer::new(),
         surface: None,
         raised: false,
