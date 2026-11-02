@@ -10,6 +10,7 @@ use i2c::Peripheral;
 use server::{MessageId as _, ScalarHandler, ServerContext};
 use xous_ticktimer::TicktimerCallback;
 
+use super::TouchGestureOrigin;
 use crate::{gpio::GpioPermissions, handlers::TouchPollTimerCallback, Gui};
 
 /// While a finger is down, the controller is read again if it doesn't interrupt for this long, so that a
@@ -29,10 +30,10 @@ const MAX_READ_FAILURES: u32 = 20;
 /// After this many resets in a row that didn't help, we stop polling and wait for an interrupt instead.
 const MAX_RESETS: u32 = 3;
 
-/// While a finger is down the controller reports it on every scan, so a longer time between two reads
-/// means that we missed scans (we were busy, or reads failed). A finger can't be lifted and put down
-/// elsewhere in less time.
-const MISSED_SCANS_TIME: Duration = Duration::from_millis(60);
+/// While a finger is down we read the controller at least every `TOUCH_POLL_INTERVAL_MS`, so a much longer
+/// time between two reads means that we missed scans (we were busy, or reads failed). A finger can't be
+/// lifted and put down elsewhere in less time.
+const MISSED_SCANS_TIME: Duration = Duration::from_millis(100);
 
 i2c::use_api!();
 
@@ -132,8 +133,9 @@ impl HwTouchState {
     }
 
     /// Reads a frame. Returns `Ok(None)` when the controller reports the same scan again, and `Err` for a
-    /// failed read or a frame that can't be trusted.
-    fn read_frame(&mut self) -> Result<Option<Frame>, ()> {
+    /// failed read or a frame that can't be trusted. With `check_missed_scans`, fingers that may have been
+    /// lifted and put down elsewhere while we missed scans are cancelled.
+    fn read_frame(&mut self, check_missed_scans: bool) -> Result<Option<Frame>, ()> {
         let result = self.ft3269.read_frame().map_err(|e| log::debug!("Could not read touch frame: {e:?}"));
         let frame = result.and_then(|data| {
             // A real lift is reported with the lifted points, so a frame of only zeroes is a failed read
@@ -156,7 +158,9 @@ impl HwTouchState {
                 self.read_failures = 0;
                 self.resets = 0;
                 let now = Instant::now();
-                if self.last_read.is_some_and(|last| now - last > MISSED_SCANS_TIME) && self.tracker.has_fingers_down()
+                if check_missed_scans
+                    && self.last_read.is_some_and(|last| now - last > MISSED_SCANS_TIME)
+                    && self.tracker.has_fingers_down()
                 {
                     self.tracker.frame_lost();
                 }
@@ -182,6 +186,12 @@ impl Gui {
     }
 
     pub(crate) fn handle_touch_irq(&mut self) {
+        // Gestures of the system don't confirm anything, and may be slow to handle (the switcher scales the
+        // app's frame down), so their fingers aren't cancelled for missed scans
+        let system_gesture = matches!(
+            self.touch_state.origin,
+            TouchGestureOrigin::ControlCenter | TouchGestureOrigin::VirtualButton | TouchGestureOrigin::AppSwitcherGesture
+        );
         let hw_state = &mut self.touch_state.hw_state;
         if !hw_state.enabled {
             log::debug!("Spurious touch IRQ");
@@ -200,7 +210,7 @@ impl Gui {
             hw_state.quiet_until = None;
         }
 
-        let frame = hw_state.read_frame();
+        let frame = hw_state.read_frame(!system_gesture);
         if hw_state.read_failures >= MAX_READ_FAILURES {
             hw_state.resets += 1;
             if hw_state.resets <= MAX_RESETS {

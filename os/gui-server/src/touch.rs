@@ -4,6 +4,8 @@
 #[cfg(keyos)]
 mod atsama5d2;
 
+use std::time::{Duration, Instant};
+
 use gui_server_api::consts::{
     KEYBOARD_TOP_BAR_MARGIN, VIRT_BUTTON_PHYS_HEIGHT, VIRT_BUTTON_PHYS_ORIGIN_X, VIRT_BUTTON_PHYS_ORIGIN_Y,
     VIRT_BUTTON_PHYS_WIDTH,
@@ -39,9 +41,9 @@ pub(crate) struct TouchState {
 
     /// The app that the first finger is being forwarded to.
     primary_target: Option<xous::PID>,
-    /// Apps that missed a press or release because their input queue was full, and how many times we
-    /// tried since. They are sent a `TouchCancel` as soon as their queue has room.
-    pub(crate) touch_resync: Vec<(xous::PID, u32)>,
+    /// Apps that missed a press or release because their input queue was full, and since when. They are
+    /// sent a `TouchCancel` as soon as their queue has room.
+    pub(crate) touch_resync: Vec<(xous::PID, Instant)>,
 
     /// Bit `n` is set while the finger with id `n` is down.
     pub(crate) fingers_down: u16,
@@ -328,21 +330,20 @@ impl Gui {
 
     fn touch_resync_later(&mut self, pid: xous::PID) {
         if !self.touch_state.touch_resync.iter().any(|&(p, _)| p == pid) {
-            self.touch_state.touch_resync.push((pid, 0));
+            self.touch_state.touch_resync.push((pid, Instant::now()));
         }
     }
 
     /// Sends the cancellations that didn't fit into the apps' input queues before. Gives up on an app
     /// that doesn't read its input for a while: a press it gets later cancels what it missed anyway.
     pub(crate) fn touch_resync(&mut self) {
-        const MAX_RESYNC_ATTEMPTS: u32 = 40;
+        const MAX_RESYNC_TIME: Duration = Duration::from_secs(2);
 
         let windows = &self.windows;
-        self.touch_state.touch_resync.retain_mut(|(pid, attempts)| {
+        self.touch_state.touch_resync.retain(|(pid, since)| {
             let Some(window) = windows.get(pid) else { return false };
             let msg = xous::Message::new_scalar(InputMessage::TouchCancel as usize, 0, 0, 0, 0);
-            *attempts += 1;
-            xous::try_send_message(window.input_cid, msg).is_err() && *attempts < MAX_RESYNC_ATTEMPTS
+            xous::try_send_message(window.input_cid, msg).is_err() && since.elapsed() < MAX_RESYNC_TIME
         });
     }
 

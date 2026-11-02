@@ -626,6 +626,8 @@ mod tests {
                     0 => (0, Cancelled),
                     1..=3 if !down.is_empty() => (down[random(down.len() as u64) as usize], Ended),
                     4..=7 if !down.is_empty() => (down[random(down.len() as u64) as usize], Moved),
+                    // A press of the only finger down, whose lift we missed
+                    8 if down.len() == 1 => (down[0], Started),
                     _ if down.len() < 4 => {
                         let id = if down.is_empty() { 0 } else { (1..).find(|i| !down.contains(i)).unwrap() };
                         (id, Started)
@@ -633,6 +635,8 @@ mod tests {
                     _ => continue,
                 };
                 match phase {
+                    // The finger was lifted and put down again: a new touch sequence
+                    Started if down.contains(&id) => tainted = false,
                     Started => down.push(id),
                     Ended => down.retain(|&d| d != id),
                     _ => {}
@@ -659,6 +663,7 @@ mod tests {
                     }
                 }
                 if down.is_empty() {
+                    assert!(!pressed, "pressed after all fingers were lifted");
                     tainted = false;
                 }
             }
